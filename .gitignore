@@ -1,0 +1,11 @@
+# python
+__pycache__/
+*.pyc
+
+# local credentials / configs (never commit)
+*.ini
+.cloudflare-discovery.conf
+
+# terraform (if exports are generated here)
+*.tfstate*
+.terraform/
