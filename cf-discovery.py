@@ -866,7 +866,8 @@ def pick_resources(sel_svcs, commands, *, non_interactive=False, only=None):
     """Stage 2: resource-type selection per service.
     Returns {svc: set(types)} or None when the user aborted with q."""
     out = {}
-    for svc in sel_svcs:
+    n_sel = len(sel_svcs)
+    for idx, svc in enumerate(sel_svcs, 1):
         items_all = type_choices(commands, svc)
         if not items_all:
             out[svc] = set()
@@ -879,8 +880,8 @@ def pick_resources(sel_svcs, commands, *, non_interactive=False, only=None):
             continue
         items = [(t, t + (f"  ({n} ids)" if n else "")) for t, n in items_all]
         ok, sel = _select_keys(
-            f"RESOURCE TYPES — {svc} (space ± · a all · n none · enter confirm · q abort)",
-            "(types found on the source account/zone for this service)", items)
+            f"RESOURCE TYPES — {svc}  ·  service {idx} of {n_sel}",
+            "space ± · a all · n none · enter confirm & next service · q abort", items)
         if not ok:
             return None
         out[svc] = sel
@@ -1353,7 +1354,8 @@ def pick_resources(sel_svcs, commands, *, non_interactive=False, only=None):
     """Stage 2: resource-type selection per service.
     Returns {svc: set(types)} or None when the user aborted with q."""
     out = {}
-    for svc in sel_svcs:
+    n_sel = len(sel_svcs)
+    for idx, svc in enumerate(sel_svcs, 1):
         items_all = type_choices(commands, svc)
         if not items_all:
             out[svc] = set()
@@ -1366,8 +1368,8 @@ def pick_resources(sel_svcs, commands, *, non_interactive=False, only=None):
             continue
         items = [(t, t + (f"  ({n} ids)" if n else "")) for t, n in items_all]
         ok, sel = _select_keys(
-            f"RESOURCE TYPES — {svc} (space ± · a all · n none · enter confirm · q abort)",
-            "(types found on the source account/zone for this service)", items)
+            f"RESOURCE TYPES — {svc}  ·  service {idx} of {n_sel}",
+            "space ± · a all · n none · enter confirm & next service · q abort", items)
         if not ok:
             return None
         out[svc] = sel
