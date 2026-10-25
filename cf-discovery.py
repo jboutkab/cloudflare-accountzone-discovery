@@ -723,8 +723,121 @@ SERVICE_ORDER = ["account", "dns", "loadbalancing", "ssl-tls", "cdn", "security"
                  "workers", "email", "ai", "observability", "waiting-rooms",
                  "zero-trust", "networking", "misc"]   # networking LAST (spectrum = post-cutover)
 
+def service_choices(commands):
+    """[(svc, n_cmds, n_types)] for every configured service, in dependency order."""
+    group = {}
+    for c in commands:
+        if c["out"] in ("zone.tf", "account.tf"):
+            for t in c["types"]:
+                svc = TYPE_TO_SERVICE.get(t, "misc")
+                e = group.setdefault(svc, {"types": set(), "cmds": set()})
+                e["types"].add(t); e["cmds"].add(c["cmd"])
+        else:
+            svc = TYPE_TO_SERVICE.get(c["types"][0], "misc")
+            e = group.setdefault(svc, {"types": set(), "cmds": set()})
+            e["cmds"].add(c["cmd"])
+    return [(s, len(group[s]["cmds"]), len(group[s]["types"]))
+            for s in SERVICE_ORDER if s in group]
 
-def write_services(outdir, commands, manual_rows, aid, zid, target_aid=None, target_zid=None):
+
+def pick_services(choices, *, non_interactive=False, only=None):
+    """Return the selected service names. Picker style follows
+    CF_DISCOVERY_PICKER in {curses,prompt,none}; default: curses on a TTY,
+    plain prompt without one, everything for --non-interactive/--services-only."""
+    mode = os.environ.get("CF_DISCOVERY_PICKER", "").lower()
+    names = [s for s, _c, _t in choices]
+    if only is not None:
+        bad = set(only) - set(names)
+        if bad:
+            sys.exit(f"--services-only: unknown/unconfigured: {', '.join(sorted(bad))}\n"
+                     f"configured services: {', '.join(names)}")
+        return [s for s, _c, _t in choices if s in set(only)]
+    if non_interactive or mode == "none" or not choices:
+        return names
+    if mode in ("", "curses"):
+        try:
+            return _pick_curses(choices)
+        except Exception:
+            mode = "prompt"
+    if mode in ("", "prompt"):
+        return _pick_prompt(choices)
+    return names
+
+
+def _pick_curses(choices):
+    import curses
+    sel = {s for s, _c, _t in choices}
+    cur = 0
+
+    def draw(win):
+        win.erase()
+        win.addstr(0, 0, "Select services to export  (space: toggle · a: all · n: none · enter: confirm · q: abort)",
+                   curses.A_BOLD)
+        win.addstr(1, 0, "(only services with findings are listed)")
+        for i, (s, n_cmd, n_type) in enumerate(choices):
+            mark = "[*]" if choices[i][0] in sel else "[ ]"
+            attr = curses.A_REVERSE if i == cur else 0
+            win.addstr(3 + i, 2, f"{mark} {s:<16}{n_type:>2} resource types · {n_cmd} invocations", attr)
+        win.refresh()
+
+    def loop(win):
+        nonlocal cur
+        curses.curs_set(0)
+        while True:
+            draw(win)
+            k = win.getch()
+            if k in (curses.KEY_UP, ord("k")):
+                cur = (cur - 1) % len(choices)
+            elif k in (curses.KEY_DOWN, ord("j")):
+                cur = (cur + 1) % len(choices)
+            elif k == ord(" "):
+                s = choices[cur][0]
+                sel.symmetric_difference_update({s})
+            elif k == ord("a"):
+                sel.update(s for s, _c, _t in choices)
+            elif k == ord("n"):
+                sel.clear()
+            elif k in (10, 13, curses.KEY_ENTER):
+                return True
+            elif k in (ord("q"), 27):
+                return False
+
+    if curses.wrapper(loop):
+        return [s for s, _c, _t in choices if s in sel]
+    return []
+
+
+def _pick_prompt(choices):
+    sel = {s for s, _c, _t in choices}
+    while True:
+        print("\nservices with findings (space/number toggles · a=all · n=none · enter=confirm):")
+        for i, (s, n_cmd, n_type) in enumerate(choices, 1):
+            mark = "[*]" if s in sel else "[ ]"
+            print(f"  {i:>2}. {mark} {s:<16}{n_type:>2} resource types · {n_cmd} invocations")
+        try:
+            line = input("toggle #: ").strip()
+        except EOFError:
+            break
+        if not line:
+            break
+        l = line.lower()
+        if l == "a":
+            sel = {s for s, _c, _t in choices}; continue
+        if l == "n":
+            sel.clear(); continue
+        if l == "q":
+            return []
+        for tok in l.replace(",", " ").split():
+            if tok.isdigit() and 1 <= int(tok) <= len(choices):
+                s = choices[int(tok) - 1][0]
+                sel.symmetric_difference_update({s})
+    return [s for s, _c, _t in choices if s in sel]
+
+
+
+
+def write_services(outdir, commands, manual_rows, aid, zid, target_aid=None, target_zid=None,
+                   include=None):
     """--services mode: one terraform workspace (dir + own state) per product
     area. Bulk zone/account.tf batches are SPLIT by service. Every dir is made
     self-contained: provider/variables/versions, terraform.tfvars(.example),
@@ -750,7 +863,7 @@ def write_services(outdir, commands, manual_rows, aid, zid, target_aid=None, tar
             svc_group.setdefault(svc, {"batches": {}, "cmds": []})["cmds"].append(c["cmd"])
 
     os.makedirs(outdir, exist_ok=True)
-    present = [s for s in SERVICE_ORDER if s in svc_group]
+    present = [s for s in SERVICE_ORDER if s in svc_group and (include is None or s in include)]
 
     for svc in present:
         d = os.path.join(outdir, svc)
@@ -859,6 +972,8 @@ def main():
                    help="account the workspaces will APPLY into (drives terraform.tfvars + the sed remap)")
     p.add_argument("--target-zone-id", metavar="ZONE",
                    help="zone the workspaces will APPLY into")
+    p.add_argument("--services-only", metavar="LIST",
+                   help="comma-separated services to generate (skips the interactive picker)")
     p.add_argument("-q", "--quiet", action="store_true", help="suppress probe progress on stderr")
     args = p.parse_args()
     QUIET = args.quiet
@@ -885,12 +1000,19 @@ def main():
     commands = build_commands(zone_rows, acct_rows, z_special, a_special, aid, zid)
 
     if args.services:
+        choices = service_choices(commands)
+        only = [s.strip() for s in args.services_only.split(",")] if args.services_only else None
+        sel = pick_services(choices, non_interactive=args.non_interactive, only=only)
+        if not sel:
+            sys.exit("no services selected -- nothing to do")
+        print(f"== workspaces: {', '.join(sel)}")
         present = write_services(args.services, commands,
                                  [r for r in zone_rows + acct_rows
                                   if r[3].startswith(("manual", "derive"))],
                                  aid, zid,
                                  target_aid=args.target_account_id,
-                                 target_zid=args.target_zone_id)
+                                 target_zid=args.target_zone_id,
+                                 include=set(sel))
     else:
         print("=== cf-terraforming commands ===\n")
         print("  # NOTE: cloudflare_zone is NOT included — cf-terraforming's zone")

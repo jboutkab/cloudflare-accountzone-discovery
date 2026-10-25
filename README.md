@@ -63,6 +63,7 @@ Each of `account_id`, `zone_id`, `api_token` is resolved in this order
 | `--non-interactive` | Never prompt; fail if inputs are missing |
 | `--write-sh FILE` | Write the generated commands to a runnable shell script |
 | `--services DIR` | Write **one terraform workspace per product area** under `DIR/` (each with its own state) |
+| `--services-only LIST` | Comma-separated services to generate — skips the picker (`dns,security`) |
 | `-q, --quiet` | Suppress probe progress on stderr |
 
 ## `--services` — one terraform state per product area
@@ -93,10 +94,18 @@ services/
 └── export-all.sh   # runs the workspaces in dependency order
 ```
 
+In an interactive terminal a **point-and-shoot picker** lists every *configured*
+service (only ones the probes actually found) and lets you toggle with **space**
+(`a` = all, `n` = none, `enter` = confirm, `q` = abort); without a terminal it
+falls back to a numbered prompt, and `--non-interactive` / `--services-only` /
+`CF_DISCOVERY_PICKER=none` skip it entirely.
+
 ```bash
 # one target account/zone pre-wired into every workspace:
 python3 cf-discovery.py --services services/ \
     --target-account-id <acct2> --target-zone-id <zone2>
+#        -> interactive checkbox list, or pick on the CLI:
+python3 cf-discovery.py --services services/ --services-only dns,security
 
 # per workspace:
 cd services/dns && export CF_SOURCE_TOKEN=<source token> && bash setup.sh && terraform plan
