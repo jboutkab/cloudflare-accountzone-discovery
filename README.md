@@ -88,7 +88,7 @@ cd services/dns && bash setup.sh        # or: bash services/export-all.sh  (all,
 ### 4. Import what already exists on the target
 
 Some objects exist on every zone/account and must be **imported, never created** —
-most importantly the default ruleset phase entrypoints. `security/import.tf` (generated
+most importantly the default ruleset phase entrypoints. `security/imports.tf` (generated
 in step 3.4) pairs each exported ruleset block with the **target zone's** ruleset ID,
 matched by phase:
 
@@ -119,7 +119,7 @@ cd ../loadbalancing      && terraform init && terraform plan && terraform apply
 # …through zero-trust
 ```
 
-Terrform state grows **one file per service** (`services/<svc>/terraform.tfstate`) — a
+Terraform state grows **one file per service** (`services/<svc>/terraform.tfstate`) — a
 broken apply in one area never touches the others, plans stay fast, and changing one
 product re-plans only that directory.
 
