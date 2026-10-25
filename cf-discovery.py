@@ -656,7 +656,7 @@ def build_commands(zone_rows, acct_rows, z_special, a_special, aid, zid):
         else:
             flags = (f'$(for id in {" ".join(ids)}; do '
                      f'printf -- \'--resource-id "{rtype}=%s" \' "$id"; done)')
-        extras.append({"types": [rtype], "out": out, "cmd":
+        extras.append({"types": [rtype], "n": len(ids), "out": out, "cmd":
             f'cf-terraforming generate {scope_flag} {scope_val} '
             f'--resource-type {rtype} {flags} > {out}'})
 
@@ -754,47 +754,59 @@ def pick_services(choices, *, non_interactive=False, only=None):
         return [s for s, _c, _t in choices if s in set(only)]
     if non_interactive or mode == "none" or not choices:
         return names
+    items = [(s, f"{s:<16}{t:>2} resource types · {c} invocations") for s, c, t in choices]
+    ok, sel = _select_keys(
+        "Select services to export (space ± · a all · n none · enter confirm · q abort)",
+        "(only services with findings are listed)", items)
+    if not ok:
+        return []
+    return [s for s, _c, _t in choices if s in sel]
+
+
+def _select_keys(title, subtitle, items):
+    """items: [(key, label)]. Returns (confirmed, {keys}).
+    curses first; falls back to a numbered prompt; CF_DISCOVERY_PICKER forces a mode."""
+    sel = {k for k, _ in items}
+    mode = os.environ.get("CF_DISCOVERY_PICKER", "").lower()
     if mode in ("", "curses"):
         try:
-            return _pick_curses(choices)
+            return _select_curses(title, subtitle, items)
         except Exception:
             mode = "prompt"
     if mode in ("", "prompt"):
-        return _pick_prompt(choices)
-    return names
+        return _select_prompt(title, subtitle, items)
+    return True, sel
 
 
-def _pick_curses(choices):
+def _select_curses(title, subtitle, items):
     import curses
-    sel = {s for s, _c, _t in choices}
-    cur = 0
+    sel = {k for k, _ in items}
+    cur = [0]
 
     def draw(win):
         win.erase()
-        win.addstr(0, 0, "Select services to export  (space: toggle · a: all · n: none · enter: confirm · q: abort)",
-                   curses.A_BOLD)
-        win.addstr(1, 0, "(only services with findings are listed)")
-        for i, (s, n_cmd, n_type) in enumerate(choices):
-            mark = "[*]" if choices[i][0] in sel else "[ ]"
-            attr = curses.A_REVERSE if i == cur else 0
-            win.addstr(3 + i, 2, f"{mark} {s:<16}{n_type:>2} resource types · {n_cmd} invocations", attr)
+        win.addstr(0, 0, title, curses.A_BOLD)
+        if subtitle:
+            win.addstr(1, 0, subtitle)
+        for i, (k, label) in enumerate(items):
+            mark = "[*]" if k in sel else "[ ]"
+            attr = curses.A_REVERSE if i == cur[0] else 0
+            win.addstr(3 + i, 2, f"{mark} {label}", attr)
         win.refresh()
 
     def loop(win):
-        nonlocal cur
         curses.curs_set(0)
         while True:
             draw(win)
             k = win.getch()
             if k in (curses.KEY_UP, ord("k")):
-                cur = (cur - 1) % len(choices)
+                cur[0] = (cur[0] - 1) % len(items)
             elif k in (curses.KEY_DOWN, ord("j")):
-                cur = (cur + 1) % len(choices)
+                cur[0] = (cur[0] + 1) % len(items)
             elif k == ord(" "):
-                s = choices[cur][0]
-                sel.symmetric_difference_update({s})
+                sel.symmetric_difference_update({items[cur[0]][0]})
             elif k == ord("a"):
-                sel.update(s for s, _c, _t in choices)
+                sel.update(k2 for k2, _2 in items)
             elif k == ord("n"):
                 sel.clear()
             elif k in (10, 13, curses.KEY_ENTER):
@@ -802,42 +814,568 @@ def _pick_curses(choices):
             elif k in (ord("q"), 27):
                 return False
 
-    if curses.wrapper(loop):
-        return [s for s, _c, _t in choices if s in sel]
-    return []
+    return curses.wrapper(loop), sel
 
 
-def _pick_prompt(choices):
-    sel = {s for s, _c, _t in choices}
+def _select_prompt(title, subtitle, items):
+    sel = {k for k, _ in items}
+    first = True
     while True:
-        print("\nservices with findings (space/number toggles · a=all · n=none · enter=confirm):")
-        for i, (s, n_cmd, n_type) in enumerate(choices, 1):
-            mark = "[*]" if s in sel else "[ ]"
-            print(f"  {i:>2}. {mark} {s:<16}{n_type:>2} resource types · {n_cmd} invocations")
+        head = title if first else title + " (current)"
+        print(f"\n{head}" + (f"\n{subtitle}" if first and subtitle else ""))
+        for i, (k, label) in enumerate(items, 1):
+            mark = "[*]" if k in sel else "[ ]"
+            print(f"  {i:>2}. {mark} {label}")
+        first = False
         try:
-            line = input("toggle #: ").strip()
+            line = input("toggle # (space-sep ± · a all · n none · enter confirm · q abort): ").strip()
         except EOFError:
-            break
+            return True, sel
         if not line:
-            break
-        l = line.lower()
-        if l == "a":
-            sel = {s for s, _c, _t in choices}; continue
-        if l == "n":
+            return True, sel
+        token = line.lower()
+        if token == "a":
+            sel.update(k for k, _2 in items); continue
+        if token == "n":
             sel.clear(); continue
-        if l == "q":
-            return []
-        for tok in l.replace(",", " ").split():
-            if tok.isdigit() and 1 <= int(tok) <= len(choices):
-                s = choices[int(tok) - 1][0]
-                sel.symmetric_difference_update({s})
+        if token == "q":
+            return False, sel
+        for tok in token.replace(",", " ").split():
+            if tok.isdigit() and 1 <= int(tok) <= len(items):
+                sel.symmetric_difference_update({items[int(tok) - 1][0]})
+    return True, sel
+
+
+def type_choices(commands, svc):
+    """[(type, n_ids)] for svc — batch types (sorted) then dedicated-rid types."""
+    batch, rids = [], []
+    for c in commands:
+        if c["out"] in ("zone.tf", "account.tf"):
+            batch.extend((t, 0) for t in c["types"]
+                         if TYPE_TO_SERVICE.get(t, "misc") == svc)
+        elif TYPE_TO_SERVICE.get(c["types"][0], "misc") == svc:
+            rids.append((c["types"][0], c.get("n", 0)))
+    seen, out = set(), []
+    for t, n in sorted(batch) + rids:
+        if t not in seen:
+            seen.add(t); out.append((t, n))
+    return out
+
+
+def pick_resources(sel_svcs, commands, *, non_interactive=False, only=None):
+    """Stage 2: resource-type selection per service.
+    Returns {svc: set(types)} or None when the user aborted with q."""
+    out = {}
+    for svc in sel_svcs:
+        items_all = type_choices(commands, svc)
+        if not items_all:
+            out[svc] = set()
+            continue
+        if only is not None:
+            out[svc] = {t for t, _ in items_all if t in only}
+            continue
+        if non_interactive:
+            out[svc] = {t for t, _ in items_all}
+            continue
+        items = [(t, t + (f"  ({n} ids)" if n else "")) for t, n in items_all]
+        ok, sel = _select_keys(
+            f"RESOURCE TYPES — {svc} (space ± · a all · n none · enter confirm · q abort)",
+            "(types found on the source account/zone for this service)", items)
+        if not ok:
+            return None
+        out[svc] = sel
+    return out
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+
+def resolve_config(args):
+    cfg = {
+        "api_token":  os.environ.get("CLOUDFLARE_API_TOKEN"),
+        "account_id": os.environ.get("CLOUDFLARE_ACCOUNT_ID"),
+        "zone_id":    os.environ.get("CLOUDFLARE_ZONE_ID"),
+    }
+    path = args.config or DEFAULT_CONFIG
+    if os.path.exists(path):
+        cp = configparser.ConfigParser()
+        cp.read(path)
+        cfg.update({k: cp["cloudflare"][k]
+                    for k in ("api_token", "account_id", "zone_id")
+                    if cp.has_option("cloudflare", k)})
+        cfg["_config_path"] = path
+    if args.account_id: cfg["account_id"] = args.account_id
+    if args.zone_id:    cfg["zone_id"]    = args.zone_id
+    if args.token:      cfg["api_token"]  = args.token
+
+    if args.non_interactive and not all(cfg.values()):
+        fail("missing credentials and --non-interactive was set")
+    if not cfg["account_id"]:
+        cfg["account_id"] = input("Account ID: ").strip() or None
+    if not cfg["zone_id"]:
+        cfg["zone_id"] = input("Zone ID: ").strip() or None
+    if not cfg["api_token"]:
+        cfg["api_token"] = getpass.getpass("API token: ").strip() or None
+    if not all(cfg.values()):
+        fail("account_id, zone_id and api_token are all required")
+    return cfg
+
+
+def save_config(cfg, path=None):
+    path = path or DEFAULT_CONFIG
+    cp = configparser.ConfigParser()
+    cp["cloudflare"] = {k: cfg[k] for k in ("api_token", "account_id", "zone_id")}
+    with open(path, "w") as fh:
+        cp.write(fh)
+    os.chmod(path, 0o600)
+    print(f"config saved to {path} (mode 600)")
+
+
+def fail(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+QUIET = False   # set by --quiet in main()
+
+
+def progress(msg, end="\n"):
+    """Progress output goes to stderr so stdout stays redirectable."""
+    if QUIET:
+        return
+    sys.stderr.write(msg + end)
+    sys.stderr.flush()
+
+
+
+# ---------------------------------------------------------------------------
+
+
+def scan(endpoint_map, base_info, token):
+    """Probe every endpoint, returning (rows, specials):
+      rows      = (endpoint | 'note:', finding, v5_resource_type, action)
+      specials  = resolved IDs for --resource-id commands + extra notes
+    base_info   = (api_root, url_base, ctx)  where ctx fills {zone_id}/{account_id}
+    """
+    api_root, url_base, ctx = base_info
+    rows, specials = [], {}
+    total_eps = len(endpoint_map)
+    scope = url_base.rsplit("/", 2)[1]
+    for idx, (ep, rtypes, note) in enumerate(endpoint_map, 1):
+        special = note.replace("SPECIAL:", "") if note.startswith("SPECIAL:") else None
+        note_opt = "" if special else note
+        wrap_key = wrap_rtype = None
+        if special and "->" in special:
+            special, wrap = special.split("->", 1)
+            if ":" in special:  # wrap:key form
+                special, wrap_key = special.split(":", 1)
+            wrap_key = wrap_key or special
+            wrap_rtype = wrap
+
+        if ep == "note:":
+            if note_opt:
+                rows.append(("(no API list)", "-", ", ".join(rtypes), f"derive — {note_opt}"))
+            continue
+
+        full = ep.format(**ctx) if "{" in ep else ep
+        url = f"{api_root}/{full[1:]}" if full.startswith("@") else f"{url_base}/{full}"
+        progress(f"[.. {scope:>5} {idx:3d}/{total_eps}] {ep} ...", end="")
+        items, err = fetch_all(url, token)
+
+
+        # collect ids needed by the dedicated --resource-id commands
+        if not err and isinstance(items, list) and items:
+            if ep == "tunnels":
+                specials["tunnel_ids"] = [t["id"] for t in items if isinstance(t, dict)]
+                # cf-terraforming silently aborts the remaining ids on the FIRST
+                # 404 (tunnels without a config object) — pre-filter to tunnels
+                # that actually have one (skip probing when several hundred)
+                if len(specials["tunnel_ids"]) <= 50:
+                    cfg_ids = []
+                    for j, tid in enumerate(specials["tunnel_ids"], 1):
+                        progress(f"[.. {scope:>5} {idx:3d}/{total_eps}] {ep} -> probing configs {j}/{len(specials['tunnel_ids'])} ...", end="\r")
+                        _, e = fetch_all(f"{url_base}/cfd_tunnel/{tid}/configurations", token)
+                        if not e:
+                            cfg_ids.append(tid)
+                    specials["tunnel_config_ids"] = cfg_ids
+            elif ep == "workers/scripts":
+                specials["script_ids"] = [s.get("id") for s in items if s.get("id")]
+            elif ep == "api_gateway/operations":
+                specials["shield_op_ids"] = [o["operation_id"] for o in items if o.get("operation_id")]
+            elif ep == "dlp/profiles":
+                specials["dlp_custom_ids"] = [p["id"] for p in items if p.get("type") == "custom"]
+                specials["dlp_predef_ids"]  = [p["id"] for p in items if p.get("type") == "predefined"]
+
+        if err:
+            result = err
+        elif special == "wrap" and isinstance(items, dict):
+            vals = items.get(wrap_key) or []
+            result = str(len(vals))
+        elif isinstance(items, list):
+            result = str(len(items))
+        elif items:
+            result = "present"
+        else:
+            result = "0"
+
+        v5 = ", ".join(wrap_rtype.split(",")) if wrap_rtype else (
+             ", ".join(rtypes) if rtypes else "-")
+        if wrap_rtype:
+            v5 = wrap_rtype
+
+        if err:
+            action = f"skip ({err})" + (f" — {note_opt}" if note_opt else "")
+        elif (isinstance(items, list) and not items) or items is None or \
+             (special == "wrap" and result == "0"):
+            action = "not configured"
+        elif special == "zone_settings":
+            settings = [s["id"] for s in items if s.get("editable")]
+            specials["settings"] = settings
+            result = f"{result} ({len(settings)} editable)"
+            v5, action = "cloudflare_zone_setting", "export via --resource-id"
+        elif special == "waiting_rooms":
+            specials["wr_ids"] = [w["id"] for w in items]
+            rules = 0
+            for j, wid in enumerate(specials["wr_ids"][:50], 1):
+                progress(f"[.. {scope:>5} {idx:3d}/{total_eps}] {ep} -> rules {j}/{min(len(specials['wr_ids']),50)} ...", end="\r")
+                rr, _e = fetch_all(f"{url_base}/waiting_rooms/{wid}/rules", token)
+                if isinstance(rr, dict):
+                    rules += len(rr.get("rules") or [])
+                elif isinstance(rr, list):
+                    rules += len(rr)
+            result = f"{result} (+{rules} rules)"
+            v5 = "cloudflare_waiting_room, cloudflare_waiting_room_settings"
+            action = "export (+ events/rules via --resource-id)"
+        elif special == "lists":
+            specials["list_ids"] = [l["id"] for l in items]
+            v5 = "cloudflare_list, cloudflare_list_item"
+            action = "export (+ items via --resource-id)"
+        elif special == "pages":
+            doms = sum(len(p.get("domains") or []) for p in items)
+            specials["pages_names"] = [p["name"] for p in items if p.get("name")]
+            result = f"{result} (+{doms} domains)"
+            v5 = "cloudflare_pages_project, cloudflare_pages_domain"
+            action = "export"
+        elif special == "queues":
+            if items:
+                specials["queue_ids"] = [q["queue_id"] for q in items if q.get("queue_id")]
+            cons = 0
+            for j, q in enumerate(items[:25], 1):
+                progress(f"[.. {scope:>5} {idx:3d}/{total_eps}] {ep} -> consumers {j}/{min(len(items),25)} ...", end="\r")
+                cc, _e = fetch_all(f"{url_base}/queues/{q['queue_id']}/consumers", token)
+                if isinstance(cc, list):
+                    cons += len(cc)
+            result = f"{result} (+{cons} consumers)"
+            v5 = "cloudflare_queue, cloudflare_queue_consumer"
+            action = "export"
+        elif special == "r2":
+            buckets = items.get("buckets") or []
+            cd, mg, pairs = 0, 0, []
+            probe = buckets[:25]
+            for j, b in enumerate(probe, 1):
+                progress(f"[.. {scope:>5} {idx:3d}/{total_eps}] {ep} -> bucket domains {j}/{len(probe)} ...", end="\r")
+                cc, _e = fetch_all(f"{url_base}/r2/buckets/{b['name']}/domains/custom", token)
+                if isinstance(cc, dict):
+                    for dd in cc.get("domains") or []:
+                        cd += 1
+                        pairs.append(f"{b['name']},{dd.get('domain')}")
+                mm, _e = fetch_all(f"{url_base}/r2/buckets/{b['name']}/domains/managed", token)
+                if isinstance(mm, dict) and mm.get("enabled"):
+                    mg += 1
+                    pairs.append(f"{b['name']},{mm.get('domain')}")
+            specials["r2_pairs"] = pairs
+            result = f"{len(buckets)} (+{cd} custom domains, {mg} managed)"
+            v5 = "cloudflare_r2_bucket, cloudflare_r2_custom_domain, cloudflare_r2_managed_domain"
+            action = "export"
+        elif special == "wrap":
+            action = "export" + (f" ({note_opt})" if note_opt else "")
+        elif rtypes:
+            action = "export" + (f" ({note_opt})" if note_opt else "")
+        else:
+            v5 = "(no cf-terraforming v5 support)"
+            action = f"manual — {note_opt}"
+        rows.append((ep, result, v5, action))
+        pad = " " * max(0, 68 - len(ep))
+        progress(f"\r[OK {scope:>5} {idx:3d}/{total_eps}] {ep}{pad}{result}")
+    progress(f"\r[DONE {scope:>4}] {total_eps} endpoints probed" + " " * 40)
+    return rows, specials
+
+
+def print_mapping(rows):
+    w_ep  = max(len(r[0]) for r in rows) + 2
+    w_res = max(len(r[1]) for r in rows) + 2
+    w_v5  = max(len(r[2]) for r in rows) + 2
+    print("\n=== Endpoint -> cf-terraforming v5 resource mapping ===")
+    print(f"{'endpoint':<{w_ep}}{'finding':<{w_res}}{'v5 resource type':<{w_v5}}action")
+    print("-" * (w_ep + w_res + w_v5 + 30))
+    for ep, result, v5, action in rows:
+        print(f"{ep:<{w_ep}}{result:<{w_res}}{v5:<{w_v5}}{action}")
+    print()
+
+
+def build_commands(zone_rows, acct_rows, z_special, a_special, aid, zid):
+    """Group findings into cf-terraforming generate commands.
+
+    Batches contain ONLY types safe to bulk-generate; anything in
+    RESOURCE_ID_REQUIRED goes to dedicated --resource-id commands
+    (a batch containing them aborts mid-run — verified empirically).
+    """
+    zone_batch, acct_batch, extras = set(), set(), []
+
+    def batch_cmd(scope_flag, scope_val, types, out):
+        types = sorted(types - RESOURCE_ID_REQUIRED)
+        if types:
+            extras.append({"types": types, "out": out, "cmd":
+                f'cf-terraforming generate {scope_flag} {scope_val} '
+                f'--resource-type "{",".join(types)}" > {out}'})
+
+    def rid_cmd(scope_flag, scope_val, rtype, ids, out):
+        # IMPORTANT: --resource-id must be passed ONCE PER VALUE — cf-terraforming
+        # does NOT iterate comma-separated value lists (it would put them all
+        # into one URL path segment: /queues/<id1,id2,id3>/consumers -> 400).
+        # For >3 ids we generate the flags inline with a tiny shell loop so the
+        # ids appear once as a plain list instead of repeating the flag reword.
+        if len(ids) <= 3:
+            flags = " ".join(f'--resource-id "{rtype}={i}"' for i in ids)
+        else:
+            flags = (f'$(for id in {" ".join(ids)}; do '
+                     f'printf -- \'--resource-id "{rtype}=%s" \' "$id"; done)')
+        extras.append({"types": [rtype], "n": len(ids), "out": out, "cmd":
+            f'cf-terraforming generate {scope_flag} {scope_val} '
+            f'--resource-type {rtype} {flags} > {out}'})
+
+    # ---------------- zone ----------------
+    for ep, rtypes, _n in ZONE_ENDPOINTS:
+        row = next((r for r in zone_rows if r[0] == ep), None)
+        if row and row[3].startswith("export"):
+            zone_batch.update(rtypes or row[2].split(", "))
+    if "wr_ids" in z_special:
+        zone_batch.update({"cloudflare_waiting_room",
+                           "cloudflare_waiting_room_settings"})
+    batch_cmd("--zone", zid, zone_batch, "zone.tf")
+    if z_special.get("settings"):
+        rid_cmd("--zone", zid, "cloudflare_zone_setting", z_special["settings"], "zone-settings.tf")
+    if z_special.get("wr_ids"):
+        rid_cmd("--zone", zid, "cloudflare_waiting_room_event", z_special["wr_ids"], "waiting-room-events.tf")
+        rid_cmd("--zone", zid, "cloudflare_waiting_room_rules", z_special["wr_ids"], "waiting-room-rules.tf")
+    if z_special.get("shield_op_ids"):
+        rid_cmd("--zone", zid,
+                "cloudflare_api_shield_operation_schema_validation_settings",
+                z_special["shield_op_ids"], "shield-op-validation.tf")
+    # literal resource-id specifiers (no per-hostname override => output may be empty)
+    rid_cmd("--zone", zid, "cloudflare_hostname_tls_setting",
+            ["ciphers", "min_tls_version"], "hostname-tls.tf")
+
+    # ---------------- account ----------------
+    for ep, rtypes, _n in ACCOUNT_ENDPOINTS:
+        row = next((r for r in acct_rows if r[0] == ep), None)
+        if row and row[3].startswith("export"):
+            acct_batch.update(rtypes or row[2].split(", "))
+    if "list_ids" in a_special:
+        acct_batch.add("cloudflare_list")
+    acct_batch.add("cloudflare_account")              # account itself always exists
+    acct_batch.discard("-")
+    batch_cmd("--account", aid, acct_batch, "account.tf")
+
+    if a_special.get("list_ids"):
+        rid_cmd("--account", aid, "cloudflare_list_item", a_special["list_ids"], "list-items.tf")
+    if a_special.get("tunnel_config_ids"):
+        rid_cmd("--account", aid, "cloudflare_zero_trust_tunnel_cloudflared_config",
+                a_special["tunnel_config_ids"], "tunnel-configs.tf")
+    if a_special.get("queue_ids"):
+        rid_cmd("--account", aid, "cloudflare_queue_consumer", a_special["queue_ids"], "queue-consumers.tf")
+    if a_special.get("dlp_custom_ids"):
+        rid_cmd("--account", aid, "cloudflare_zero_trust_dlp_custom_profile",
+                a_special["dlp_custom_ids"], "dlp-custom-profiles.tf")
+    if a_special.get("dlp_predef_ids"):
+        rid_cmd("--account", aid, "cloudflare_zero_trust_dlp_predefined_profile",
+                a_special["dlp_predef_ids"], "dlp-predefined-profiles.tf")
+    if a_special.get("pages_names"):
+        rid_cmd("--account", aid, "cloudflare_pages_domain", a_special["pages_names"], "pages-domains.tf")
+    # r2 custom/managed domains: composite "bucket,domain" ids — cf-terraforming
+    # parses --resource-id by comma splitting, so pairs go to separate one-off
+    # commands; surfaced as a derive note row instead (see mapping above).
+    if a_special.get("script_ids"):
+        ids = a_special["script_ids"]
+        rid_cmd("--account", aid, "cloudflare_workers_cron_trigger", ids, "workers-cron.tf")
+        rid_cmd("--account", aid, "cloudflare_workers_deployment", ids, "workers-deployments.tf")
+        rid_cmd("--account", aid, "cloudflare_workers_script_subdomain", ids, "workers-subdomains.tf")
+    return extras
+
+
+SERVICE_ORDER = ["account", "dns", "loadbalancing", "ssl-tls", "cdn", "security",
+                 "workers", "email", "ai", "observability", "waiting-rooms",
+                 "zero-trust", "networking", "misc"]   # networking LAST (spectrum = post-cutover)
+
+def service_choices(commands):
+    """[(svc, n_cmds, n_types)] for every configured service, in dependency order."""
+    group = {}
+    for c in commands:
+        if c["out"] in ("zone.tf", "account.tf"):
+            for t in c["types"]:
+                svc = TYPE_TO_SERVICE.get(t, "misc")
+                e = group.setdefault(svc, {"types": set(), "cmds": set()})
+                e["types"].add(t); e["cmds"].add(c["cmd"])
+        else:
+            svc = TYPE_TO_SERVICE.get(c["types"][0], "misc")
+            e = group.setdefault(svc, {"types": set(), "cmds": set()})
+            e["cmds"].add(c["cmd"])
+    return [(s, len(group[s]["cmds"]), len(group[s]["types"]))
+            for s in SERVICE_ORDER if s in group]
+
+
+def pick_services(choices, *, non_interactive=False, only=None):
+    """Return the selected service names. Picker style follows
+    CF_DISCOVERY_PICKER in {curses,prompt,none}; default: curses on a TTY,
+    plain prompt without one, everything for --non-interactive/--services-only."""
+    mode = os.environ.get("CF_DISCOVERY_PICKER", "").lower()
+    names = [s for s, _c, _t in choices]
+    if only is not None:
+        bad = set(only) - set(names)
+        if bad:
+            sys.exit(f"--services-only: unknown/unconfigured: {', '.join(sorted(bad))}\n"
+                     f"configured services: {', '.join(names)}")
+        return [s for s, _c, _t in choices if s in set(only)]
+    if non_interactive or mode == "none" or not choices:
+        return names
+    items = [(s, f"{s:<16}{t:>2} resource types · {c} invocations") for s, c, t in choices]
+    ok, sel = _select_keys(
+        "Select services to export (space ± · a all · n none · enter confirm · q abort)",
+        "(only services with findings are listed)", items)
+    if not ok:
+        return []
     return [s for s, _c, _t in choices if s in sel]
 
 
+def _select_keys(title, subtitle, items):
+    """items: [(key, label)]. Returns (confirmed, {keys}).
+    curses first; falls back to a numbered prompt; CF_DISCOVERY_PICKER forces a mode."""
+    sel = {k for k, _ in items}
+    mode = os.environ.get("CF_DISCOVERY_PICKER", "").lower()
+    if mode in ("", "curses"):
+        try:
+            return _select_curses(title, subtitle, items)
+        except Exception:
+            mode = "prompt"
+    if mode in ("", "prompt"):
+        return _select_prompt(title, subtitle, items)
+    return True, sel
+
+
+def _select_curses(title, subtitle, items):
+    import curses
+    sel = {k for k, _ in items}
+    cur = [0]
+
+    def draw(win):
+        win.erase()
+        win.addstr(0, 0, title, curses.A_BOLD)
+        if subtitle:
+            win.addstr(1, 0, subtitle)
+        for i, (k, label) in enumerate(items):
+            mark = "[*]" if k in sel else "[ ]"
+            attr = curses.A_REVERSE if i == cur[0] else 0
+            win.addstr(3 + i, 2, f"{mark} {label}", attr)
+        win.refresh()
+
+    def loop(win):
+        curses.curs_set(0)
+        while True:
+            draw(win)
+            k = win.getch()
+            if k in (curses.KEY_UP, ord("k")):
+                cur[0] = (cur[0] - 1) % len(items)
+            elif k in (curses.KEY_DOWN, ord("j")):
+                cur[0] = (cur[0] + 1) % len(items)
+            elif k == ord(" "):
+                sel.symmetric_difference_update({items[cur[0]][0]})
+            elif k == ord("a"):
+                sel.update(k2 for k2, _2 in items)
+            elif k == ord("n"):
+                sel.clear()
+            elif k in (10, 13, curses.KEY_ENTER):
+                return True
+            elif k in (ord("q"), 27):
+                return False
+
+    return curses.wrapper(loop), sel
+
+
+def _select_prompt(title, subtitle, items):
+    sel = {k for k, _ in items}
+    first = True
+    while True:
+        head = title if first else title + " (current)"
+        print(f"\n{head}" + (f"\n{subtitle}" if first and subtitle else ""))
+        for i, (k, label) in enumerate(items, 1):
+            mark = "[*]" if k in sel else "[ ]"
+            print(f"  {i:>2}. {mark} {label}")
+        first = False
+        try:
+            line = input("toggle # (space-sep ± · a all · n none · enter confirm · q abort): ").strip()
+        except EOFError:
+            return True, sel
+        if not line:
+            return True, sel
+        token = line.lower()
+        if token == "a":
+            sel.update(k for k, _2 in items); continue
+        if token == "n":
+            sel.clear(); continue
+        if token == "q":
+            return False, sel
+        for tok in token.replace(",", " ").split():
+            if tok.isdigit() and 1 <= int(tok) <= len(items):
+                sel.symmetric_difference_update({items[int(tok) - 1][0]})
+    return True, sel
+
+
+def type_choices(commands, svc):
+    """[(type, n_ids)] for svc — batch types (sorted) then dedicated-rid types."""
+    batch, rids = [], []
+    for c in commands:
+        if c["out"] in ("zone.tf", "account.tf"):
+            batch.extend((t, 0) for t in c["types"]
+                         if TYPE_TO_SERVICE.get(t, "misc") == svc)
+        elif TYPE_TO_SERVICE.get(c["types"][0], "misc") == svc:
+            rids.append((c["types"][0], c.get("n", 0)))
+    seen, out = set(), []
+    for t, n in sorted(batch) + rids:
+        if t not in seen:
+            seen.add(t); out.append((t, n))
+    return out
+
+
+def pick_resources(sel_svcs, commands, *, non_interactive=False, only=None):
+    """Stage 2: resource-type selection per service.
+    Returns {svc: set(types)} or None when the user aborted with q."""
+    out = {}
+    for svc in sel_svcs:
+        items_all = type_choices(commands, svc)
+        if not items_all:
+            out[svc] = set()
+            continue
+        if only is not None:
+            out[svc] = {t for t, _ in items_all if t in only}
+            continue
+        if non_interactive:
+            out[svc] = {t for t, _ in items_all}
+            continue
+        items = [(t, t + (f"  ({n} ids)" if n else "")) for t, n in items_all]
+        ok, sel = _select_keys(
+            f"RESOURCE TYPES — {svc} (space ± · a all · n none · enter confirm · q abort)",
+            "(types found on the source account/zone for this service)", items)
+        if not ok:
+            return None
+        out[svc] = sel
+    return out
 
 
 def write_services(outdir, commands, manual_rows, aid, zid, target_aid=None, target_zid=None,
-                   include=None):
+                   include=None, include_types=None):
     """--services mode: one terraform workspace (dir + own state) per product
     area. Bulk zone/account.tf batches are SPLIT by service. Every dir is made
     self-contained: provider/variables/versions, terraform.tfvars(.example),
@@ -855,10 +1393,14 @@ def write_services(outdir, commands, manual_rows, aid, zid, target_aid=None, tar
             scope_flag, scope_val = (("--zone", zid) if c["cmd"].startswith("cf-terraforming generate --zone")
                                      else ("--account", aid))
             for t in c["types"]:
+                if include_types is not None and t not in include_types:
+                    continue
                 svc = TYPE_TO_SERVICE.get(t, "misc")
                 buckets = svc_group.setdefault(svc, {"batches": {}, "cmds": []})
                 buckets["batches"].setdefault((scope_flag, scope_val, c["out"]), set()).add(t)
         else:                                                # dedicated --resource-id cmd
+            if include_types is not None and c["types"][0] not in include_types:
+                continue
             svc = TYPE_TO_SERVICE.get(c["types"][0], "misc")
             svc_group.setdefault(svc, {"batches": {}, "cmds": []})["cmds"].append(c["cmd"])
 
@@ -974,6 +1516,8 @@ def main():
                    help="zone the workspaces will APPLY into")
     p.add_argument("--services-only", metavar="LIST",
                    help="comma-separated services to generate (skips the interactive picker)")
+    p.add_argument("--resources-only", metavar="LIST",
+                   help="comma-separated resource TYPES to include (skips the per-service type picker)")
     p.add_argument("-q", "--quiet", action="store_true", help="suppress probe progress on stderr")
     args = p.parse_args()
     QUIET = args.quiet
@@ -1005,14 +1549,35 @@ def main():
         sel = pick_services(choices, non_interactive=args.non_interactive, only=only)
         if not sel:
             sys.exit("no services selected -- nothing to do")
-        print(f"== workspaces: {', '.join(sel)}")
+
+        only_res = ([s.strip() for s in args.resources_only.split(",")]
+                    if args.resources_only else None)
+        if only_res:
+            known = {t for c in commands for t in c["types"]}
+            bad = set(only_res) - known
+            if bad:
+                sys.exit(f"--resources-only: unknown/unconfigured: {', '.join(sorted(bad))}\n"
+                         f"found types: {', '.join(sorted(known))}")
+        type_sel = pick_resources(sel, commands,
+                                  non_interactive=args.non_interactive or only is not None,
+                                  only=only_res)
+        if type_sel is None:
+            sys.exit("aborted")
+        auto_sel = pick_services(choices, non_interactive=True, only=only)
+        skipped = [s for s in auto_sel if not type_sel.get(s)]
+        sel = [s for s in sel if type_sel.get(s)]
+        print(f"== workspaces: {(', '.join(sel)) or '(none)'}")
+        if skipped:
+            print(f"   (deselected all resource types: {', '.join(skipped)})")
+        flat_types = set().union(*(type_sel[s] for s in sel)) if sel else set()
         present = write_services(args.services, commands,
                                  [r for r in zone_rows + acct_rows
                                   if r[3].startswith(("manual", "derive"))],
                                  aid, zid,
                                  target_aid=args.target_account_id,
                                  target_zid=args.target_zone_id,
-                                 include=set(sel))
+                                 include=set(sel),
+                                 include_types=flat_types)
     else:
         print("=== cf-terraforming commands ===\n")
         print("  # NOTE: cloudflare_zone is NOT included — cf-terraforming's zone")
