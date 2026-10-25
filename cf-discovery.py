@@ -724,10 +724,18 @@ SERVICE_ORDER = ["account", "dns", "loadbalancing", "ssl-tls", "cdn", "security"
                  "zero-trust", "networking", "misc"]   # networking LAST (spectrum = post-cutover)
 
 
-def write_services(outdir, commands, manual_rows, aid, zid):
+def write_services(outdir, commands, manual_rows, aid, zid, target_aid=None, target_zid=None):
     """--services mode: one terraform workspace (dir + own state) per product
-    area. Bulk zone/account.tf batches are SPLIT by service — every dir only
-    gets the resource types that belong to it."""
+    area. Bulk zone/account.tf batches are SPLIT by service. Every dir is made
+    self-contained: provider/variables/versions, terraform.tfvars(.example),
+    .gitignore, export.sh and setup.sh (export -> remap -> imports -> init)."""
+    import service_templates as tpl
+
+    def ensure(path, content):
+        if not os.path.exists(path):
+            with open(path, "w") as fh:
+                fh.write(content)
+
     svc_group = {}
     for c in commands:
         if c["out"] in ("zone.tf", "account.tf"):          # bulk batch — split per service
@@ -744,40 +752,58 @@ def write_services(outdir, commands, manual_rows, aid, zid):
     os.makedirs(outdir, exist_ok=True)
     present = [s for s in SERVICE_ORDER if s in svc_group]
 
-    VERSIONS = """terraform {
-  required_version = ">= 1.5"
-  required_providers {
-    cloudflare = { source = "cloudflare/cloudflare", version = "~> 5.0" }
-  }
-}
-"""
     for svc in present:
         d = os.path.join(outdir, svc)
         os.makedirs(d, exist_ok=True)
-        if not os.path.exists(os.path.join(d, "versions.tf")):
-            with open(os.path.join(d, "versions.tf"), "w") as fh:
-                fh.write(VERSIONS)
 
-        parts = []
+        # scaffolding (never overwrite hand edits)
+        ensure(os.path.join(d, "provider.tf"),  tpl.PROVIDER_TF)
+        ensure(os.path.join(d, "variables.tf"), tpl.VARIABLES_TP if False else tpl.VARIABLES_TF)
+        ensure(os.path.join(d, "versions.tf"),  tpl.VERSIONS_TF)
+        ensure(os.path.join(d, ".gitignore"),   tpl.GITIGNORE)
+        tfvars_name = "terraform.tfvars" if (target_aid and target_zid) else "terraform.tfvars.example"
+        ensure(os.path.join(d, tfvars_name),
+               tpl.TFVARS_HEAD
+               + f'account_id = "{target_aid or "<target-account-id>"}"\n'
+               + f'zone_id    = "{target_zid or "<target-zone-id>"}"\n'
+               + '# api_token = "..."    # prefer: export CLOUDFLARE_API_TOKEN=<target token>\n')
+
+        # export.sh: batches split by service + dedicated commands
         info = svc_group[svc]
+        parts = []
         for (scope_flag, scope_val, out), types in sorted(info["batches"].items()):
             parts.append(
                 f'cf-terraforming generate {scope_flag} {scope_val} '
                 f'--resource-type "{",".join(sorted(types))}" > {out}')
-        parts.extend(c for c in dict.fromkeys(info["cmds"]))   # dedupe, keep order
+        parts.extend(cmd for cmd in dict.fromkeys(info["cmds"]))   # dedupe, keep order
         with open(os.path.join(d, "export.sh"), "w") as fh:
             fh.write("#!/usr/bin/env bash\nset -euo pipefail\ncd \"$(dirname \"$0\")\"\n\n")
             fh.write("[ -d .terraform ] || terraform init -input=false -upgrade >/dev/null\n\n")
             fh.write("\n\n".join(parts) + "\n")
         os.chmod(os.path.join(d, "export.sh"), 0o755)
 
+        # security carries the zone-scoped ruleset batch -> ruleset imports helper
+        is_security = svc == "security" and any(
+            t == "cloudflare_ruleset"
+            for (sf, sv, o), ts in info["batches"].items() if sf == "--zone"
+            for t in ts)
+        if svc == "security" and is_security:
+            p = os.path.join(d, "rulesets-import.py")
+            with open(p, "w") as fh:
+                fh.write(tpl.RULESETS_IMPORT_PY)
+            os.chmod(p, 0o755)
+
+        p = os.path.join(d, "setup.sh")
+        with open(p, "w") as fh:
+            fh.write(tpl.render_setup(svc, aid, zid, target_aid, target_zid))
+        os.chmod(p, 0o755)
+
+    # dependency-ordered runner -> delegates to each dir's setup.sh
     with open(os.path.join(outdir, "export-all.sh"), "w") as fh:
-        fh.write("#!/usr/bin/env bash\nset -euo pipefail\ncd \"$(dirname \"$0\")\"\n\n")
-        fh.write("# ordered: dependencies first; networking LAST (spectrum needs\n# an ACTIVE zone — run its export/apply only after the NS cutover).\n\n")
+        fh.write(tpl.EXPORT_ALL_HEADER)
         for svc in present:
-            fh.write(
-                f'echo "== exporting {svc} =="\n'
-                f'(cd {svc} && terraform init -input=false -upgrade >/dev/null && bash export.sh)\n')
+            fh.write(f'echo "== {svc} =="\n'
+                     f'(cd {svc} && bash setup.sh "${{1:-}}")\n')
     os.chmod(os.path.join(outdir, "export-all.sh"), 0o755)
 
     with open(os.path.join(outdir, "README.md"), "w") as fh:
@@ -788,8 +814,17 @@ def write_services(outdir, commands, manual_rows, aid, zid):
             cut = "**post-cutover** (spectrum needs an active zone)" if svc == "networking" else "pre-cutover"
             fh.write(f"| {i} | {svc}/ | {cut} |\n")
         fh.write("\nRun everything:\n\n```bash\nbash export-all.sh\n```\n\n"
-                 "Run one service:\n\n```bash\ncd <service> && terraform init && bash export.sh\n```\n\n"
-                 f"Exports read from the source account/zone: `{aid}` / `{zid}`.\n")
+                 "Run one service:\n\n```bash\ncd <service> && bash setup.sh && terraform plan\n```\n\n"
+                 "What `setup.sh` does in each workspace:\n\n"
+                 "1. copies a `terraform` binary in (cf-terraforming needs it in the CWD)\n"
+                 "2. runs `export.sh` the first time (lazy init; `--fresh` forces a re-export)\n"
+                 "3. remaps **SOURCE -> TARGET** zone/account ids inside the exported `*.tf`\n"
+                 "4. (security/) composes `imports.tf` for the default phase rulesets on the\n"
+                 "   target zone (needs `CF_SOURCE_TOKEN` + `CLOUDFLARE_API_TOKEN` set)\n"
+                 "5. runs `terraform init`\n\n"
+                 f"Exports read from **source** `{aid}` / `{zid}`; "
+                 f"applies target **{target_aid or '<unset>'}** / **{target_zid or '<unset>'}** "
+                 "(set via `--target-account-id` / `--target-zone-id`).\n")
         manual_lines = sorted({f"- **{TYPE_TO_SERVICE.get(v.split(',')[0].strip(), 'misc')}** — `{v}`"
                                for _e, _f, v, a in manual_rows})
         if manual_lines:
@@ -797,10 +832,12 @@ def write_services(outdir, commands, manual_rows, aid, zid):
 
     print(f"== services written to {outdir}/ ({len(present)} workspaces)")
     for svc in present:
-        info = svc_group[svc]
-        n_cmds = len(info["batches"]) + len(info["cmds"])
-        n_types = sum(len(t) for t in info["batches"].values())
+        info2 = svc_group[svc]
+        n_cmds = len(info2["batches"]) + len(info2["cmds"])
+        n_types = sum(len(t) for t in info2["batches"].values())
         print(f"   {svc:<16} {n_cmds:>2} invocations, {n_types} resource types")
+    if not (target_aid and target_zid):
+        print("   NOTE: no --target-* given -- files reference the SOURCE account/zone")
     return present
 
 
@@ -818,6 +855,10 @@ def main():
     p.add_argument("--write-sh", metavar="FILE", help="also write the commands to a shell script")
     p.add_argument("--services", metavar="DIR",
                    help="write one terraform workspace per product area under DIR/ (each with its own export.sh and terraform state)")
+    p.add_argument("--target-account-id", metavar="ACCT",
+                   help="account the workspaces will APPLY into (drives terraform.tfvars + the sed remap)")
+    p.add_argument("--target-zone-id", metavar="ZONE",
+                   help="zone the workspaces will APPLY into")
     p.add_argument("-q", "--quiet", action="store_true", help="suppress probe progress on stderr")
     args = p.parse_args()
     QUIET = args.quiet
@@ -847,7 +888,9 @@ def main():
         present = write_services(args.services, commands,
                                  [r for r in zone_rows + acct_rows
                                   if r[3].startswith(("manual", "derive"))],
-                                 aid, zid)
+                                 aid, zid,
+                                 target_aid=args.target_account_id,
+                                 target_zid=args.target_zone_id)
     else:
         print("=== cf-terraforming commands ===\n")
         print("  # NOTE: cloudflare_zone is NOT included — cf-terraforming's zone")

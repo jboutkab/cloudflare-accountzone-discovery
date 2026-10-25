@@ -94,10 +94,28 @@ services/
 ```
 
 ```bash
-python3 cf-discovery.py --services services/   # discover + write the tree
-bash services/export-all.sh                    # export every workspace
-cd services/dns && terraform init && terraform plan
+# one target account/zone pre-wired into every workspace:
+python3 cf-discovery.py --services services/ \
+    --target-account-id <acct2> --target-zone-id <zone2>
+
+# per workspace:
+cd services/dns && export CF_SOURCE_TOKEN=<source token> && bash setup.sh && terraform plan
 ```
+
+Every workspace directory is self-contained — `provider.tf` + `variables.tf` +
+`versions.tf`, a `terraform.tfvars` scaffold pre-filled with the target ids,
+`.gitignore` (incl. `terraform.tfvars`, state, binaries), `export.sh`, and
+`setup.sh` which runs the whole prepare sequence:
+
+1. copies a `terraform` binary in (cf-terraforming needs it in the CWD)
+2. runs `export.sh` the first time (lazy init; `setup.sh --fresh` re-exports)
+3. remaps **SOURCE -> TARGET** zone/account ids inside the exported `*.tf`
+4. (`security/` only) composes `imports.tf` by phase-matching the source zone's
+   default ruleset entrypoints to the target zone's (`rulesets-import.py`)
+5. `terraform init`
+
+Token convention: `CF_SOURCE_TOKEN` = source account (exports + mappings),
+`CLOUDFLARE_API_TOKEN` = target account (imports lookup + `terraform apply`).
 
 Rule: any resource type that isn't explicitly mapped lands in a `misc/` directory,
 so a new/unmapped service is never silently dropped.
