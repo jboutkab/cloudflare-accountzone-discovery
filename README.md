@@ -95,11 +95,14 @@ services/
 └── export-all.sh   # runs the workspaces in dependency order
 ```
 
-In an interactive terminal a **two-stage point-and-shoot picker** lists every
-*configured* service (only ones the probes actually found) and lets you toggle
-with **space** (`a` = all, `n` = none, `enter` = confirm, `q` = abort) — and
-then asks per service which **resource types** to include (batches and
-dedicated-id exports, with id counts). Without a terminal it falls back to a
+In an interactive terminal a **two-stage point-and-shoot picker** asks:
+
+1. **which services** — one checkbox list of every *configured* service
+   (toggle with **space**; `a` = all, `n` = none, `enter` = confirm, `q` = abort)
+2. **which resource types**, per selected service — a sequence of screens,
+   `RESOURCE TYPES — <svc> · service i of N` (`enter` accepts the current
+   checkmarks and moves to the next service). Batches are presented per type,
+   dedicated-id exports with their id counts. Without a terminal it falls back to a
 numbered prompt; `--non-interactive` / `--services-only` / `--resources-only` /
 `CF_DISCOVERY_PICKER=none` skip the UI entirely. Selecting zero types in a
 service skips its workspace.
