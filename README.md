@@ -1,8 +1,155 @@
 # cf-discovery
 
-Scans a Cloudflare **account + zone** for configured resources and prints the exact
-[`cf-terraforming`](https://github.com/cloudflare/cf-terraforming#v5) commands needed to
-export them — the discovery phase of a migration, automated.
+Scans a Cloudflare **account + zone** for every configured resource and produces ready-to-run [`cf-terraforming`](https://github.com/cloudflare/cf-terraforming#v5) exports — the **discovery phase of a zone/account migration, automated**.
+
+## What it does
+
+1. Probes **~130 API endpoints** (~50 zone + ~80 account, read-only **GET**s) to build a
+   complete inventory of everything configured: DNS records, rulesets, load balancers,
+   spectrum apps, tunnels, workers, KV, queues, Pages, R2, Access, Gateway policies, DLP,
+   and ~25 more product areas.
+2. Prints an **endpoint → cf-terraforming v5 mapping table** — for every finding: which
+   v5 Terraform resource it becomes, and whether cf-terraforming can export it
+   (`export`, `export via --resource-id`, `manual`, `derive`, `not configured`).
+   Rows needing **manual migration** (workers scripts, custom pages, Magic IPsec, PAC
+   files, …) are listed at the end so they show up on your checklist.
+3. Emits **working cf-terraforming commands** — either flat (`zone.tf` + `account.tf`) or
+   — with `--services DIR` — split into **independent Terraform workspaces, one per
+   product area**, each self-contained and carrying its own state file.
+
+Every command it generates is known to **complete successfully against a live account** —
+repeated `--resource-id` flags instead of comma-joining, dedicated commands for the ~19
+generator-quirk resource types, wrapped-response handling, batch abort prevention —
+all handled for you (see [quirks](#cf-terraforming-quirks-the-generated-commands-already-handle)).
+
+---
+
+## Migrating to a new account / migrated zone — full workflow
+
+Scenario: your zone lives on **source account A**, and you want it running on
+**target account B** as a new (`pending`) zone that already exists there. Terraform
+becomes the source of truth afterwards.
+
+### 0. Prerequisites
+
+- Python 3.8+ (**stdlib only**), `cf-terraforming` and `terraform` installed
+- A **source token** with read access to account A (+ zone, see [Token scopes](#token-scopes))
+- A **target token** with admin on account B + the new zone
+- The new zone created on account B (status `pending` is fine for everything **except
+  spectrum** — see step 6)
+
+### 1. Discover + generate the workspaces
+
+```bash
+python3 cf-discovery.py \
+    --account-id <ACCOUNT_A> --zone-id <ZONE_A> \
+    --services services/ \
+    --target-account-id <ACCOUNT_B> --target-zone-id <ZONE_B>
+```
+
+Two-stage picker (interactive): select the services you want, then the resource
+types inside each. Non-interactive equivalents: `--services-only`, `--resources-only`,
+`--non-interactive` (= everything).
+
+This writes, per product area (e.g. `services/dns/`, `services/security/`):
+
+| file | purpose |
+|---|---|
+| `export.sh` | service-scoped `cf-terraforming generate` commands |
+| `setup.sh` | the one-shot prepare workflow (below) |
+| `provider.tf` / `variables.tf` / `versions.tf` | provider reads the token from the env |
+| `terraform.tfvars` | pre-filled with the **target** account/zone IDs (git-ignored) |
+| `.gitignore` | state, plans, binaries, `terraform.tfvars` |
+| `rulesets-import.py` | (`security/` only) builds `imports.tf` |
+| `README.md` / `export-all.sh` | at the tree root |
+
+### 2. Set the two tokens
+
+```bash
+export CF_SOURCE_TOKEN=<token for ACCOUNT_A>     # used for exports + import mapping
+export CLOUDFLARE_API_TOKEN=<token for ACCOUNT_B> # used for terraform plan/apply
+```
+
+### 3. Prepare each workspace — `setup.sh`
+
+```bash
+cd services/dns && bash setup.sh        # or: bash services/export-all.sh  (all, in order)
+```
+
+`setup.sh` does, in order:
+
+1. copies a `terraform` binary into the dir (cf-terraforming needs it in the CWD)
+2. runs `export.sh` — **once** (`setup.sh --fresh` re-exports); cf-terraforming gets
+   `CF_SOURCE_TOKEN`, i.e. it reads from the **source** account
+3. **remaps** account/zone IDs inside the exported `*.tf` from source → target
+4. only in `security/`: runs `rulesets-import.py` → writes `imports.tf`
+5. `terraform init`
+
+### 4. Import what already exists on the target
+
+Some objects exist on every zone/account and must be **imported, never created** —
+most importantly the default ruleset phase entrypoints. `security/import.tf` (generated
+in step 3.4) pairs each exported ruleset block with the **target zone's** ruleset ID,
+matched by phase:
+
+```hcl
+import {
+  to = cloudflare_ruleset.terraform_managed_resource_<src_ruleset_id>_<n>   # ddos_l7
+  id = "<ZONE_B>/<target_ruleset_id>"
+}
+```
+
+Just review it and let `terraform apply` pick up the imports. Any later **409**
+(conflict) means the object already exists on the target — add the matching `import`
+block and re-run.
+
+### 5. Plan + apply in dependency order
+
+```text
+account → dns → loadbalancing → ssl-tls → cdn → security → workers →
+email → ai → observability → waiting-rooms → zero-trust → networking (later!)
+```
+
+```bash
+# from the services/ root:
+bash export-all.sh            # prepares every workspace in that order
+
+cd services/dns          && terraform init && terraform plan && terraform apply
+cd ../loadbalancing      && terraform init && terraform plan && terraform apply
+# …through zero-trust
+```
+
+Terrform state grows **one file per service** (`services/<svc>/terraform.tfstate`) — a
+broken apply in one area never touches the others, plans stay fast, and changing one
+product re-plans only that directory.
+
+### 6. Cut over DNS, then apply networking
+
+`spectrum` applications **cannot be created on a pending zone** — Cloudflare refuses
+(HTTP 400, error 16001 *"DNS configuration does not match authenticated zone"*). So:
+
+1. point the domain's NS at the **target** zone (registrar change)
+2. wait for the zone to become `active` (dashboard / `GET /zones/<ZONE_B>`)
+3. then bring up the last workspace:
+
+```bash
+cd services/networking && terraform init && terraform plan && terraform apply
+```
+
+4. verify traffic/records parity, then decommission the source zone.
+
+### 7. Manual items (cf-terraforming can't do these)
+
+The run prints them explicitly; typically:
+
+- **workers scripts** — `wrangler deploy` / API (never supported by cf-terraforming)
+- worker **routes**, account-level **workers.dev subdomain** name
+- **custom pages**, **custom (uploaded) SSL certs** — dashboard/API, or re-upload PEM
+- **Magic IPsec tunnels**, **PAC files** — dashboard only
+- R2 **custom/managed domains** — composite `--resource-id "<bucket>,<domain>"` hints
+  are printed per bucket
+
+---
 
 ## Requirements
 
@@ -10,7 +157,7 @@ export them — the discovery phase of a migration, automated.
 - A Cloudflare API token with read access to the account/zone
   (see [Token scopes](#token-scopes))
 - [`cf-terraforming`](https://github.com/cloudflare/cf-terraforming) installed if you want
-  to run the generated commands
+  to run the generated commands; `terraform` for the workspace workflow
 
 ## Usage
 
@@ -25,8 +172,14 @@ python3 cf-discovery.py --config prod.ini
 # From CLI flags; --save persists them (mode 600) for next time
 python3 cf-discovery.py -a <ACCOUNT_ID> -z <ZONE_ID> -t <TOKEN> -c prod.ini --save
 
-# Also write the generated commands to a runnable shell script
+# Flat output (the classic mode) — prints commands, optionally to a file
 python3 cf-discovery.py --write-sh export.sh
+
+# Per-service workspaces
+python3 cf-discovery.py --services services/ \
+    --target-account-id <ACCOUNT_B> --target-zone-id <ZONE_B>
+python3 cf-discovery.py --services services/ --services-only dns,security
+python3 cf-discovery.py --services services/ --resources-only cloudflare_ruleset,cloudflare_dns_record
 
 # CI / scripted mode — fail instead of prompting when inputs are missing
 python3 cf-discovery.py --non-interactive
@@ -63,18 +216,33 @@ Each of `account_id`, `zone_id`, `api_token` is resolved in this order
 | `--non-interactive` | Never prompt; fail if inputs are missing |
 | `--write-sh FILE` | Write the generated commands to a runnable shell script |
 | `--services DIR` | Write **one terraform workspace per product area** under `DIR/` (each with its own state) |
+| `--target-account-id`, `--target-zone-id` | Pre-fill workspace tfvars + drive the source→target ID remap in `setup.sh` |
 | `--services-only LIST` | Comma-separated services to generate — skips the picker (`dns,security`) |
 | `--resources-only LIST` | Comma-separated resource **types** to include — skips the per-service type picker (`cloudflare_dns_record,cloudflare_ruleset`) |
 | `-q, --quiet` | Suppress probe progress on stderr |
 
-## `--services` — one terraform state per product area
+## What the output looks like
 
-Normal generation is flat (`zone.tf` + `account.tf`). With `--services DIR`, the same
-findings are split into **independent workspaces**, one per product area — every
-directory holds its own `versions.tf`, a scoped `export.sh` (with a lazy
-`terraform init` so it works standalone), and eventually its own `terraform.tfstate`.
-That means you can apply, destroy and drift-check per service, and keep a smaller
-blast radius:
+### The mapping table
+
+```
+endpoint                        finding          v5 resource type                      action
+------------------------------------------------------------------------------------------------------------
+dns_records                     327              cloudflare_dns_record                 export
+rulesets                        24               cloudflare_ruleset                    export (zone-kind only)
+spectrum/apps                   12               cloudflare_spectrum_application       export
+tunnels                         50               cloudflare_zero_trust_tunnel_cloudflared ... export
+pages/projects                  22 (+38 domains) cloudflare_pages_project,             export
+                                                    cloudflare_pages_domain
+logpush/jobs                    HTTP 403         cloudflare_logpush_job                skip (HTTP 403)
+workers/scripts                 303              (no cf-terraforming v5 support)       manual — wrangler/API
+```
+
+Actions: `export` = in the generated commands, `export via --resource-id` = generated
+with `--resource-id`, `manual` = no v5 support (printed in the manual list), 
+`derive` = no collection list endpoint, `not configured` / `skip` = omitted.
+
+### `--services` layout & picker
 
 ```text
 services/
@@ -90,8 +258,7 @@ services/
 ├── observability/  # logpush, notifications …
 ├── waiting-rooms/
 ├── zero-trust/     # Access, Gateway, DLP, device posture …
-├── networking/     # spectrum, tunnels, magic wan — apply LAST
-│                   #   (spectrum needs an ACTIVE zone → post-cutover only)
+├── networking/     # spectrum, tunnels, magic wan — apply LAST (post-cutover)
 └── export-all.sh   # runs the workspaces in dependency order
 ```
 
@@ -102,40 +269,12 @@ In an interactive terminal a **two-stage point-and-shoot picker** asks:
 2. **which resource types**, per selected service — a sequence of screens,
    `RESOURCE TYPES — <svc> · service i of N` (`enter` accepts the current
    checkmarks and moves to the next service). Batches are presented per type,
-   dedicated-id exports with their id counts. Without a terminal it falls back to a
-numbered prompt; `--non-interactive` / `--services-only` / `--resources-only` /
-`CF_DISCOVERY_PICKER=none` skip the UI entirely. Selecting zero types in a
-service skips its workspace.
+   dedicated-id exports show id counts.
 
-```bash
-# one target account/zone pre-wired into every workspace:
-python3 cf-discovery.py --services services/ \
-    --target-account-id <acct2> --target-zone-id <zone2>
-#        -> interactive checkbox list, or pick on the CLI:
-python3 cf-discovery.py --services services/ --services-only dns,security
-python3 cf-discovery.py --services services/ --resources-only cloudflare_ruleset,cloudflare_dns_record
-
-# per workspace:
-cd services/dns && export CF_SOURCE_TOKEN=<source token> && bash setup.sh && terraform plan
-```
-
-Every workspace directory is self-contained — `provider.tf` + `variables.tf` +
-`versions.tf`, a `terraform.tfvars` scaffold pre-filled with the target ids,
-`.gitignore` (incl. `terraform.tfvars`, state, binaries), `export.sh`, and
-`setup.sh` which runs the whole prepare sequence:
-
-1. copies a `terraform` binary in (cf-terraforming needs it in the CWD)
-2. runs `export.sh` the first time (lazy init; `setup.sh --fresh` re-exports)
-3. remaps **SOURCE -> TARGET** zone/account ids inside the exported `*.tf`
-4. (`security/` only) composes `imports.tf` by phase-matching the source zone's
-   default ruleset entrypoints to the target zone's (`rulesets-import.py`)
-5. `terraform init`
-
-Token convention: `CF_SOURCE_TOKEN` = source account (exports + mappings),
-`CLOUDFLARE_API_TOKEN` = target account (imports lookup + `terraform apply`).
-
-Rule: any resource type that isn't explicitly mapped lands in a `misc/` directory,
-so a new/unmapped service is never silently dropped.
+Without a terminal it falls back to a numbered prompt; `--non-interactive` /
+`--services-only` / `--resources-only` / `CF_DISCOVERY_PICKER=none` skip the UI.
+Selecting zero types in a service skips its workspace. And any resource type
+that isn't explicitly mapped lands in a `misc/` dir — never silently dropped.
 
 ## Progress tracking
 
@@ -150,52 +289,7 @@ a live progress line is written to **stderr** in-place:
 ```
 
 stdout stays clean (mapping table + commands), so you can do:
-
-```bash
-python3 cf-discovery.py > out.txt            # progress goes to the terminal anyway
-```
-
-## What it does
-
-1. **Verifies credentials** — calls `GET /accounts/:id` and `GET /zones/:id` first,
-   fails early with the account/zone name if the token is bad.
-2. **Probes ~40 endpoints** (zone-scoped and account-scoped) with **pagination**
-   (per-endpoint page caps are handled — see below).
-3. **Prints a mapping table** — every endpoint → finding → **cf-terraforming v5
-   resource type** → action:
-
-   ```
-   endpoint               finding  v5 resource type                        action
-   ---------------------  -------  --------------------------------------  ------------------------
-   dns_records            327      cloudflare_dns_record                   export
-   settings               56       cloudflare_zone_setting                 export via --resource-id
-   waiting_rooms          5        cloudflare_waiting_room, ...settings    export (+ events via --resource-id)
-   custom_pages           10       (no cf-terraforming v5 support)         manual — dashboard/API or v4-pin provider
-   page_rules             HTTP 400 cloudflare_page_rule                    skip (HTTP 400) — legacy API may 400
-   logpush/jobs           HTTP 403 cloudflare_logpush_job                  skip (HTTP 403) — needs Log Push perm
-   ```
-
-   Actions: `export` = included in the commands below, `export via --resource-id` =
-   generated with a `--resource-id` flag, `manual` = no v5 support (listed at the end
-   for the manual-migration checklist), `not configured` / `skip (err)` = omitted.
-4. **Emits cf-terraforming commands** for every action marked `export`:
-   - one **zone batch** command (`> zone.tf`)
-   - a **zone settings** command with `--resource-id` **auto-built from the zone's
-     editable settings**
-   - **waiting-room events** and **list items** commands with `--resource-id`
-     auto-filled from the discovered IDs
-   - one **account batch** command (`> account.tf`)
-5. Lists resources that need **manual migration** (cf-terraforming cannot export them):
-   workers scripts (wrangler), worker routes, custom pages, custom SSL certs, managed
-   headers, Magic IPsec tunnels.
-
-`cloudflare_zone` is deliberately **not** included: cf-terraforming's zone generator
-pulls **every** zone the token can see. Create the target zone manually and import it
-(`terraform import cloudflare_zone.this <zone_id>`).
-
-> The mapping table is useful on its own as a port of the official
-> [cf-terraforming v5 supported resources](https://github.com/cloudflare/cf-terraforming#v5)
-> to *this specific account* — it shows exactly which v5 resources your exports will produce.
+`python3 cf-discovery.py -q > migration-plan.md`. `--quiet` silences stderr too.
 
 ## Token scopes
 
@@ -212,49 +306,32 @@ The script only performs **GET** requests; nothing is modified.
 
 ## cf-terraforming quirks the generated commands already handle
 
-Verified empirically against a live account (2026-10) so the commands actually
+Verified empirically against a live account so the commands actually
 complete end-to-end:
 
-1. **Batches abort mid-run on `--resource-id`-only resources.** If a bulk
-   `--resource-type "a,b,c..."` batch includes a resource type that requires
-   explicit ids, cf-terraforming dies with
-   `No resource IDs defined in Terraform for resource X` — types sorted *after*
-   the offender are silently missing from the output file. The script bans all 19
-   such resource types from batches and emits dedicated commands instead.
-2. **Comma-joined `--resource-id` values break.** cf-terraforming does *not*
-   split `--resource-id "type=id1,id2"` — it puts the whole comma list into a
-   single GET URL path segment (`/queues/<id1>,<id2>/consumers -> 400`).
-   Commands therefore repeat `--resource-id "type=id"` **once per value**.
-3. **A 404 on one id quietly skips the remaining ids** in a `--resource-id`
-   run (e.g. tunnels without a config object). The script pre-filters such ids
-   (probes `/cfd_tunnel/{id}/configurations` and only emits tunnels that have one).
-4. **`cloudflare_origin_ca_certificate`'s generator is broken** (requests
-   `/certificates` without the zone param) — banned from batches; export those
-   certs via the API call shown in the mapping row instead.
-5. Some resource-id values are **names, not uuids** (`cloudflare_pages_domain`
-   takes the Pages *project name*; cron triggers / deployments / script
-   subdomains take *script names*) — the script feeds the right identifier type.
+- **batch abort on resource-id-required types** — a batch containing
+  `cloudflare_zone_setting`, `cloudflare_waiting_room_event`, tunnel configs,
+  DLP profiles, … dies mid-output with `No resource IDs defined…`; these all go
+  to their own **dedicated commands** (batch contains only safe bulk types)
+- **`--resource-id` does not iterate comma-separated ids** — repeated flags are
+  used instead (`--resource-id x=1 --resource-id x=2`); for >3 ids a tiny
+  shell loop keeps the command one line
+- **setting-list must include only editable settings** — `zone_setting` gets its
+  `--resource-id` list from the zone's *editable* settings response (script-queried)
+- **pages project listing rejects `per_page=1000`** after ~page 16 (`error 8000024`)
+  → adaptive pagination fallback
+- **`cloudflare_origin_ca_certificate` generator mis-includes `/certificates`
+  without a zone param** (400) → surfaced as a note; export via API instead
+- **`cloudflare_zero_trust_device_default_profile_certificates` soft-fails**
+  (missing bindings on its only GET) → dashboard fallback note
+- **tunnels may lack a config** (cURL install-only) → `tunnels/*/configurations`
+  is pre-probed per tunnel before emitting `--resource-id` flags
+- **`cloudflare_list_item` is not a safe batch type** → hint text only
+- **`cloudflare_zone` is deliberately not exported** — the generator pulls every
+  visible zone; create the target zone yourself: `terraform import cloudflare_zone.this <zone_id>`
 
-## Pagination & wrapped responses
+## Distribution
 
-Counts are exact regardless of per-endpoint page caps (LB pools cap at 1000, rulesets
-at 50, Access at 100, KV at 20, DNS at 100). A few endpoints (`pages/projects` and
-Stream-era APIs) **reject `per_page` entirely** (400 / 8000024) — the script detects
-this and automatically falls back to `?page=N`-only pagination. Wrapped list
-responses (`r2/buckets` → `{buckets:[...]}`, `magic/routes` → `{routes:[...]}`,
-`devices/dex_tests` → `{dex_tests:[...]}`) are unwrapped before counting. Settings
-endpoints that return a single object are reported as `present`.
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| 404 on **every** endpoint | `account_id`/`zone_id` empty or wrong | set the exports or the config file |
-| `api_token invalid` / 400 | wrong/expired token | regenerate the token |
-| 403 only on `logpush/jobs` | token lacks `Log Push` | add Log Push:Read (skip otherwise) |
-| rulesets shows more than cf-terraforming exports | zone API returns zone-kind **+ managed** rulesets; only zone-kind is migratable | expected — cf-terraforming filters correctly |
-
-## Exit codes
-
-- `0` — discovery completed (some endpoints may still report errors inline; those are skipped)
-- `1` — missing credentials, invalid token/account/zone, or `--non-interactive` with missing inputs
+Single file, stdlib Python — copy `cf-discovery.py` (+ `service_templates.py` for
+`--services`) anywhere and run. Suggested: `pipx run`, `uv tool run`, or a small
+wrapper script in your tooling repo.
