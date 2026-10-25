@@ -69,6 +69,131 @@ RESOURCE_ID_REQUIRED = {
 }
 
 # ---------------------------------------------------------------------------
+# Service grouping for --services mode: one terraform state per product area.
+# Every v5 resource type maps to exactly one service dir; unknown types land
+# in "misc" so nothing can ever be dropped silently.
+# ---------------------------------------------------------------------------
+SERVICES = {
+    "account":      ["cloudflare_account", "cloudflare_account_member",
+                     "cloudflare_account_subscription", "cloudflare_user"],
+    "dns":          ["cloudflare_dns_record", "cloudflare_zone_dnssec",
+                     "cloudflare_registrar_domain", "cloudflare_dns_firewall",
+                     "cloudflare_web3_hostname",
+                     "cloudflare_dns_zone_transfers_acl",
+                     "cloudflare_dns_zone_transfers_peer",
+                     "cloudflare_dns_zone_transfers_tsig",
+                     "cloudflare_dns_zone_transfers_incoming",
+                     "cloudflare_dns_zone_transfers_outgoing"],
+    "loadbalancing": ["cloudflare_load_balancer", "cloudflare_load_balancer_pool",
+                      "cloudflare_load_balancer_monitor", "cloudflare_healthcheck"],
+    "security":     ["cloudflare_ruleset", "cloudflare_zone_lockdown",
+                     "cloudflare_filter", "cloudflare_rate_limit", "cloudflare_page_rule",
+                     "cloudflare_bot_management", "cloudflare_managed_transforms",
+                     "cloudflare_content_scanning_expression",
+                     "cloudflare_leaked_credential_check",
+                     "cloudflare_leaked_credential_check_rule",
+                     "cloudflare_page_shield_policy",
+                     "cloudflare_api_shield_operation",
+                     "cloudflare_api_shield_schema",
+                     "cloudflare_api_shield_discovery_operation",
+                     "cloudflare_api_shield_schema_validation_settings",
+                     "cloudflare_api_shield_operation_schema_validation_settings",
+                     "cloudflare_list", "cloudflare_list_item",
+                     "cloudflare_custom_pages"],
+    "ssl-tls":      ["cloudflare_certificate_pack", "cloudflare_total_tls",
+                     "cloudflare_hostname_tls_setting", "cloudflare_mtls_certificate",
+                     "cloudflare_custom_hostname",
+                     "cloudflare_custom_hostname_fallback_origin",
+                     "cloudflare_origin_ca_certificate",
+                     "cloudflare_keyless_certificate",
+                     "cloudflare_authenticated_origin_pulls",
+                     "cloudflare_authenticated_origin_pulls_certificate",
+                     "cloudflare_custom_certificates"],
+    "networking":   ["cloudflare_spectrum_application",
+                     "cloudflare_zero_trust_tunnel_cloudflared",
+                     "cloudflare_zero_trust_tunnel_cloudflared_route",
+                     "cloudflare_zero_trust_tunnel_cloudflared_virtual_network",
+                     "cloudflare_zero_trust_tunnel_cloudflared_config",
+                     "cloudflare_magic_wan_static_route",
+                     "cloudflare_regional_hostname"],
+    "cdn":          ["cloudflare_argo_smart_routing", "cloudflare_argo_tiered_caching",
+                     "cloudflare_tiered_cache", "cloudflare_regional_tiered_cache",
+                     "cloudflare_zone_cache_reserve", "cloudflare_zone_cache_variants",
+                     "cloudflare_url_normalization_settings",
+                     "cloudflare_zone_setting",
+                     "cloudflare_snippets", "cloudflare_snippet_rules"],
+    "workers":      ["cloudflare_workers_kv_namespace",
+                     "cloudflare_workers_custom_domain",
+                     "cloudflare_workers_for_platforms_dispatch_namespace",
+                     "cloudflare_workers_script_subdomain",
+                     "cloudflare_workers_cron_trigger", "cloudflare_workers_deployment",
+                     "cloudflare_queue", "cloudflare_queue_consumer",
+                     "cloudflare_d1_database",
+                     "cloudflare_r2_bucket", "cloudflare_r2_custom_domain",
+                     "cloudflare_r2_managed_domain",
+                     "cloudflare_pages_project", "cloudflare_pages_domain",
+                     "cloudflare_stream", "cloudflare_stream_key",
+                     "cloudflare_stream_live_input", "cloudflare_stream_watermark",
+                     "cloudflare_stream_webhook",
+                     "cloudflare_turnstile_widget",
+                     "cloudflare_web_analytics_site", "cloudflare_web_analytics_rule",
+                     "cloudflare_workers_scripts", "cloudflare_workers_routes"],
+    "zero-trust":   ["cloudflare_zero_trust_access_application",
+                     "cloudflare_zero_trust_access_group",
+                     "cloudflare_zero_trust_access_identity_provider",
+                     "cloudflare_zero_trust_access_service_token",
+                     "cloudflare_zero_trust_access_policy",
+                     "cloudflare_zero_trust_access_tag",
+                     "cloudflare_zero_trust_access_custom_page",
+                     "cloudflare_zero_trust_access_key_configuration",
+                     "cloudflare_zero_trust_access_short_lived_certificate",
+                     "cloudflare_zero_trust_access_mtls_certificate",
+                     "cloudflare_zero_trust_access_mtls_hostname_settings",
+                     "cloudflare_zero_trust_organization",
+                     "cloudflare_zero_trust_access_infrastructure_target",
+                     "cloudflare_zero_trust_gateway_policy",
+                     "cloudflare_zero_trust_gateway_certificate",
+                     "cloudflare_zero_trust_gateway_proxy_endpoint",
+                     "cloudflare_zero_trust_gateway_settings",
+                     "cloudflare_zero_trust_list", "cloudflare_zero_trust_gateway_list",
+                     "cloudflare_zero_trust_dns_location",
+                     "cloudflare_zero_trust_device_default_profile",
+                     "cloudflare_zero_trust_device_default_profile_certificates",
+                     "cloudflare_zero_trust_device_default_profile_local_domain_fallback",
+                     "cloudflare_zero_trust_device_custom_profile",
+                     "cloudflare_zero_trust_device_managed_networks",
+                     "cloudflare_zero_trust_device_posture_rule",
+                     "cloudflare_zero_trust_device_posture_integration",
+                     "cloudflare_zero_trust_dex_test",
+                     "cloudflare_zero_trust_risk_behavior",
+                     "cloudflare_zero_trust_risk_scoring_integration",
+                     "cloudflare_zero_trust_dlp_dataset",
+                     "cloudflare_zero_trust_dlp_custom_profile",
+                     "cloudflare_zero_trust_dlp_predefined_profile"],
+    "observability": ["cloudflare_notification_policy",
+                      "cloudflare_notification_policy_webhooks",
+                      "cloudflare_logpush_job", "cloudflare_logpull_retention",
+                      "cloudflare_observatory_scheduled_test"],
+    "waiting-rooms": ["cloudflare_waiting_room", "cloudflare_waiting_room_settings",
+                      "cloudflare_waiting_room_event", "cloudflare_waiting_room_rules"],
+    "email":        ["cloudflare_email_routing_address",
+                     "cloudflare_email_routing_settings",
+                     "cloudflare_email_routing_dns",
+                     "cloudflare_email_routing_rule",
+                     "cloudflare_email_routing_catch_all",
+                     "cloudflare_email_security_block_sender",
+                     "cloudflare_email_security_impersonation_registry",
+                     "cloudflare_email_security_trusted_domains"],
+    "ai":           ["cloudflare_ai_gateway", "cloudflare_ai_search_instance",
+                     "cloudflare_ai_search_namespace", "cloudflare_ai_search_token",
+                     "cloudflare_calls_sfu_app", "cloudflare_calls_turn_app"],
+}
+TYPE_TO_SERVICE = {}
+for _svc, _types in SERVICES.items():
+    for _t in _types:
+        TYPE_TO_SERVICE.setdefault(_t, _svc)
+
+# ---------------------------------------------------------------------------
 # Endpoint maps: (path, [v5 resource types] | [] | None, note)
 #   []       => no cf-terraforming v5 support -> manual migration
 #   None     => special-cased in scan():  SPECIAL:<key>[:<wrap_key>]
@@ -516,9 +641,9 @@ def build_commands(zone_rows, acct_rows, z_special, a_special, aid, zid):
     def batch_cmd(scope_flag, scope_val, types, out):
         types = sorted(types - RESOURCE_ID_REQUIRED)
         if types:
-            extras.append(
+            extras.append({"types": types, "out": out, "cmd":
                 f'cf-terraforming generate {scope_flag} {scope_val} '
-                f'--resource-type "{",".join(types)}" > {out}')
+                f'--resource-type "{",".join(types)}" > {out}'})
 
     def rid_cmd(scope_flag, scope_val, rtype, ids, out):
         # IMPORTANT: --resource-id must be passed ONCE PER VALUE — cf-terraforming
@@ -531,9 +656,9 @@ def build_commands(zone_rows, acct_rows, z_special, a_special, aid, zid):
         else:
             flags = (f'$(for id in {" ".join(ids)}; do '
                      f'printf -- \'--resource-id "{rtype}=%s" \' "$id"; done)')
-        extras.append(
+        extras.append({"types": [rtype], "out": out, "cmd":
             f'cf-terraforming generate {scope_flag} {scope_val} '
-            f'--resource-type {rtype} {flags} > {out}')
+            f'--resource-type {rtype} {flags} > {out}'})
 
     # ---------------- zone ----------------
     for ep, rtypes, _n in ZONE_ENDPOINTS:
@@ -594,6 +719,91 @@ def build_commands(zone_rows, acct_rows, z_special, a_special, aid, zid):
     return extras
 
 
+SERVICE_ORDER = ["account", "dns", "loadbalancing", "ssl-tls", "cdn", "security",
+                 "workers", "email", "ai", "observability", "waiting-rooms",
+                 "zero-trust", "networking", "misc"]   # networking LAST (spectrum = post-cutover)
+
+
+def write_services(outdir, commands, manual_rows, aid, zid):
+    """--services mode: one terraform workspace (dir + own state) per product
+    area. Bulk zone/account.tf batches are SPLIT by service — every dir only
+    gets the resource types that belong to it."""
+    svc_group = {}
+    for c in commands:
+        if c["out"] in ("zone.tf", "account.tf"):          # bulk batch — split per service
+            scope_flag, scope_val = (("--zone", zid) if c["cmd"].startswith("cf-terraforming generate --zone")
+                                     else ("--account", aid))
+            for t in c["types"]:
+                svc = TYPE_TO_SERVICE.get(t, "misc")
+                buckets = svc_group.setdefault(svc, {"batches": {}, "cmds": []})
+                buckets["batches"].setdefault((scope_flag, scope_val, c["out"]), set()).add(t)
+        else:                                                # dedicated --resource-id cmd
+            svc = TYPE_TO_SERVICE.get(c["types"][0], "misc")
+            svc_group.setdefault(svc, {"batches": {}, "cmds": []})["cmds"].append(c["cmd"])
+
+    os.makedirs(outdir, exist_ok=True)
+    present = [s for s in SERVICE_ORDER if s in svc_group]
+
+    VERSIONS = """terraform {
+  required_version = ">= 1.5"
+  required_providers {
+    cloudflare = { source = "cloudflare/cloudflare", version = "~> 5.0" }
+  }
+}
+"""
+    for svc in present:
+        d = os.path.join(outdir, svc)
+        os.makedirs(d, exist_ok=True)
+        if not os.path.exists(os.path.join(d, "versions.tf")):
+            with open(os.path.join(d, "versions.tf"), "w") as fh:
+                fh.write(VERSIONS)
+
+        parts = []
+        info = svc_group[svc]
+        for (scope_flag, scope_val, out), types in sorted(info["batches"].items()):
+            parts.append(
+                f'cf-terraforming generate {scope_flag} {scope_val} '
+                f'--resource-type "{",".join(sorted(types))}" > {out}')
+        parts.extend(c for c in dict.fromkeys(info["cmds"]))   # dedupe, keep order
+        with open(os.path.join(d, "export.sh"), "w") as fh:
+            fh.write("#!/usr/bin/env bash\nset -euo pipefail\ncd \"$(dirname \"$0\")\"\n\n")
+            fh.write("[ -d .terraform ] || terraform init -input=false -upgrade >/dev/null\n\n")
+            fh.write("\n\n".join(parts) + "\n")
+        os.chmod(os.path.join(d, "export.sh"), 0o755)
+
+    with open(os.path.join(outdir, "export-all.sh"), "w") as fh:
+        fh.write("#!/usr/bin/env bash\nset -euo pipefail\ncd \"$(dirname \"$0\")\"\n\n")
+        fh.write("# ordered: dependencies first; networking LAST (spectrum needs\n# an ACTIVE zone — run its export/apply only after the NS cutover).\n\n")
+        for svc in present:
+            fh.write(
+                f'echo "== exporting {svc} =="\n'
+                f'(cd {svc} && terraform init -input=false -upgrade >/dev/null && bash export.sh)\n')
+    os.chmod(os.path.join(outdir, "export-all.sh"), 0o755)
+
+    with open(os.path.join(outdir, "README.md"), "w") as fh:
+        fh.write("# Per-service terraform workspaces\n\n"
+                 "One directory = one product area = one `terraform.tfstate`.\n\n"
+                 "| Order | Service | Applies when |\n|---|---|---|\n")
+        for i, svc in enumerate(present, 1):
+            cut = "**post-cutover** (spectrum needs an active zone)" if svc == "networking" else "pre-cutover"
+            fh.write(f"| {i} | {svc}/ | {cut} |\n")
+        fh.write("\nRun everything:\n\n```bash\nbash export-all.sh\n```\n\n"
+                 "Run one service:\n\n```bash\ncd <service> && terraform init && bash export.sh\n```\n\n"
+                 f"Exports read from the source account/zone: `{aid}` / `{zid}`.\n")
+        manual_lines = sorted({f"- **{TYPE_TO_SERVICE.get(v.split(',')[0].strip(), 'misc')}** — `{v}`"
+                               for _e, _f, v, a in manual_rows})
+        if manual_lines:
+            fh.write("\n## Manual / no-list-endpoint items\n\n" + "\n".join(manual_lines) + "\n")
+
+    print(f"== services written to {outdir}/ ({len(present)} workspaces)")
+    for svc in present:
+        info = svc_group[svc]
+        n_cmds = len(info["batches"]) + len(info["cmds"])
+        n_types = sum(len(t) for t in info["batches"].values())
+        print(f"   {svc:<16} {n_cmds:>2} invocations, {n_types} resource types")
+    return present
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -606,6 +816,8 @@ def main():
     p.add_argument("--save", action="store_true", help="persist inputs to the config file")
     p.add_argument("--non-interactive", action="store_true", help="never prompt")
     p.add_argument("--write-sh", metavar="FILE", help="also write the commands to a shell script")
+    p.add_argument("--services", metavar="DIR",
+                   help="write one terraform workspace per product area under DIR/ (each with its own export.sh and terraform state)")
     p.add_argument("-q", "--quiet", action="store_true", help="suppress probe progress on stderr")
     args = p.parse_args()
     QUIET = args.quiet
@@ -631,12 +843,18 @@ def main():
 
     commands = build_commands(zone_rows, acct_rows, z_special, a_special, aid, zid)
 
-    print("=== cf-terraforming commands ===\n")
-    print("  # NOTE: cloudflare_zone is NOT included — cf-terraforming's zone")
-    print("  # generator pulls EVERY zone the token can see. Create the target")
-    print("  # zone via dashboard/API, then: terraform import cloudflare_zone.this <zone_id>\n")
-    for c in commands:
-        print(c + "\n")
+    if args.services:
+        present = write_services(args.services, commands,
+                                 [r for r in zone_rows + acct_rows
+                                  if r[3].startswith(("manual", "derive"))],
+                                 aid, zid)
+    else:
+        print("=== cf-terraforming commands ===\n")
+        print("  # NOTE: cloudflare_zone is NOT included — cf-terraforming's zone")
+        print("  # generator pulls EVERY zone the token can see. Create the target")
+        print("  # zone via dashboard/API, then: terraform import cloudflare_zone.this <zone_id>\n")
+        for c in commands:
+            print(c["cmd"] + "\n")
 
     manual = [r for r in zone_rows + acct_rows if r[3].startswith("manual")]
     if manual:
@@ -652,10 +870,10 @@ def main():
             print(f"  {v}")
         print()
 
-    if args.write_sh:
+    if args.write_sh and not args.services:
         with open(args.write_sh, "w") as fh:
             fh.write("#!/usr/bin/env bash\nset -euo pipefail\n\n")
-            fh.write("\n\n".join(commands) + "\n")
+            fh.write("\n\n".join(c["cmd"] for c in commands) + "\n")
         print(f"commands written to {args.write_sh}")
 
     if args.save:

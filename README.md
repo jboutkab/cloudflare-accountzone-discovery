@@ -62,7 +62,45 @@ Each of `account_id`, `zone_id`, `api_token` is resolved in this order
 | `--save` | Persist resolved inputs to the config file (mode 600) |
 | `--non-interactive` | Never prompt; fail if inputs are missing |
 | `--write-sh FILE` | Write the generated commands to a runnable shell script |
+| `--services DIR` | Write **one terraform workspace per product area** under `DIR/` (each with its own state) |
 | `-q, --quiet` | Suppress probe progress on stderr |
+
+## `--services` — one terraform state per product area
+
+Normal generation is flat (`zone.tf` + `account.tf`). With `--services DIR`, the same
+findings are split into **independent workspaces**, one per product area — every
+directory holds its own `versions.tf`, a scoped `export.sh` (with a lazy
+`terraform init` so it works standalone), and eventually its own `terraform.tfstate`.
+That means you can apply, destroy and drift-check per service, and keep a smaller
+blast radius:
+
+```text
+services/
+├── account/        # account, members, subscriptions
+├── dns/            # DNS records, DNSSEC, transfers
+├── loadbalancing/  # LBs + pools/monitors (+ healthchecks)
+├── ssl-tls/        # cert packs, custom hostnames, Total TLS, mTLS …
+├── cdn/            # caching, zone settings, snippets
+├── security/       # rulesets, lists, API Shield, bot management …
+├── workers/        # KV, queues, Pages, R2, Stream, cron/deployments …
+├── email/          # Email Routing, Area 1
+├── ai/             # AI Gateway, AI Search, Calls
+├── observability/  # logpush, notifications …
+├── waiting-rooms/
+├── zero-trust/     # Access, Gateway, DLP, device posture …
+├── networking/     # spectrum, tunnels, magic wan — apply LAST
+│                   #   (spectrum needs an ACTIVE zone → post-cutover only)
+└── export-all.sh   # runs the workspaces in dependency order
+```
+
+```bash
+python3 cf-discovery.py --services services/   # discover + write the tree
+bash services/export-all.sh                    # export every workspace
+cd services/dns && terraform init && terraform plan
+```
+
+Rule: any resource type that isn't explicitly mapped lands in a `misc/` directory,
+so a new/unmapped service is never silently dropped.
 
 ## Progress tracking
 
