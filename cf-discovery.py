@@ -1450,6 +1450,15 @@ def write_services(outdir, commands, manual_rows, aid, zid, target_aid=None, tar
                 fh.write(tpl.RULESETS_IMPORT_PY)
             os.chmod(p, 0o755)
 
+        # All three load-balancing resource types live in one workspace. Install
+        # the transformer even for partial exports: it validates dependency
+        # completeness instead of leaving source-account IDs silently behind.
+        if svc == "loadbalancing":
+            p = os.path.join(d, "load-balancing-refs.py")
+            with open(p, "w") as fh:
+                fh.write(tpl.load_balancing_refs_script())
+            os.chmod(p, 0o755)
+
         p = os.path.join(d, "setup.sh")
         with open(p, "w") as fh:
             fh.write(tpl.render_setup(svc, aid, zid, target_aid, target_zid))
@@ -1476,12 +1485,23 @@ def write_services(outdir, commands, manual_rows, aid, zid, target_aid=None, tar
                  "1. copies a `terraform` binary in (cf-terraforming needs it in the CWD)\n"
                  "2. runs `export.sh` the first time (lazy init; `--fresh` forces a re-export)\n"
                  "3. remaps **SOURCE -> TARGET** zone/account ids inside the exported `*.tf`\n"
-                 "4. (security/) composes `imports.tf` for the default phase rulesets on the\n"
+                 "4. (loadbalancing/) replaces monitor/pool IDs with Terraform resource\n"
+                 "   references, including rule overrides, region/POP pools and pool weights;\n"
+                 "   account/zone IDs become `var.account_id` / `var.zone_id`; read-only\n"
+                 "   API status fields are removed while operational settings are preserved\n"
+                 "5. (security/) composes `imports.tf` for the default phase rulesets on the\n"
                  "   target zone (needs `CF_SOURCE_TOKEN` + `CLOUDFLARE_API_TOKEN` set)\n"
-                 "5. runs `terraform init`\n\n"
+                 "6. runs `terraform fmt` where needed, then `terraform init`\n\n"
                  f"Exports read from **source** `{aid}` / `{zid}`; "
                  f"applies target **{target_aid or '<unset>'}** / **{target_zid or '<unset>'}** "
                  "(set via `--target-account-id` / `--target-zone-id`).\n")
+        if "loadbalancing" in present:
+            fh.write("\n## Load-balancing migration references\n\n"
+                     "Export monitors, pools and load balancers together. The transformer fails "
+                     "without changing files if a referenced monitor/pool was omitted. Standalone "
+                     "zone healthchecks stay independent from pool monitors. Review pool-origin "
+                     "`virtual_network_id` values and `*.cfargotunnel.com` addresses separately: "
+                     "their target networking IDs cannot be inferred from this export.\n")
         manual_lines = sorted({f"- **{TYPE_TO_SERVICE.get(v.split(',')[0].strip(), 'misc')}** — `{v}`"
                                for _e, _f, v, a in manual_rows})
         if manual_lines:

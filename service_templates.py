@@ -4,6 +4,8 @@ Interpolations use @@TOKEN@@ markers + .replace() to avoid clashing with
 terraform HCL ${...} and bash ${1:-} syntax everywhere.
 """
 
+import os
+
 PROVIDER_TF = """\
 # The target account's token reaches the provider either via:
 #   export CLOUDFLARE_API_TOKEN=<target-account token>   (recommended)
@@ -58,8 +60,8 @@ terraform.tfvars
 
 TFVARS_HEAD = """\
 # Apply-time values for the TARGET account/zone.
-# (The exported *.tf files are remapped by setup.sh; these variables drive
-#  the provider block and can be referenced by future hand-written code.)
+# (The exported *.tf files are prepared by setup.sh. These variables drive
+#  the provider and account/zone references in the migrated configuration.)
 """
 
 RULESETS_IMPORT_PY = '''#!/usr/bin/env python3
@@ -118,8 +120,8 @@ SETUP_SH = """\
 #!/usr/bin/env bash
 # One-shot workspace setup for the '@@SVC@@' service:
 #   1. locate a terraform binary    2. export (runs once; --fresh to redo)
-#   3. remap SOURCE -> TARGET ids   4. (security only) compose imports.tf
-#   5. terraform init
+#   3. remap SOURCE -> TARGET ids   4. (loadbalancing) wire resource references
+#   5. (security only) compose imports.tf   6. terraform fmt + init
 #
 #  tokens:   CF_SOURCE_TOKEN = source-account token  (exports + import mapping)
 #           CLOUDFLARE_API_TOKEN = target-account token (terraform apply)
@@ -173,7 +175,12 @@ WARNING: target account/zone IDs are not configured -- the exported files still
 WARN
 fi
 
-# -- 4. (security/) compose imports.tf for the default ruleset entrypoints ----
+# -- 4. (loadbalancing/) replace source IDs with Terraform resource references -
+if [ -f load-balancing-refs.py ]; then
+    python3 load-balancing-refs.py .
+fi
+
+# -- 5. (security/) compose imports.tf for the default ruleset entrypoints ----
 if [ -f rulesets-import.py ]; then
     if [ -n "$DST_ZONE_ID" ] && [ -n "${CF_SOURCE_TOKEN:-}" ] && [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then
         python3 rulesets-import.py "$SRC_ZONE_ID" "$DST_ZONE_ID" \\
@@ -187,7 +194,11 @@ WARN
     fi
 fi
 
-# -- 5. init ------------------------------------------------------------------
+# -- 6. format + init -----------------------------------------------------------
+if [ -f load-balancing-refs.py ]; then
+    terraform fmt >/dev/null
+fi
+
 [ -d .terraform ] || terraform init -input=false -upgrade
 
 echo "== '@@SVC@@' ready. Review terraform.tfvars, then: terraform plan && terraform apply"
@@ -212,3 +223,15 @@ def render_setup(svc, src_aid, src_zid, dst_aid, dst_zid):
             .replace("@@SRC_ZONE_ID@@", src_zid)
             .replace("@@DST_ACCOUNT_ID@@", dst_aid or "")
             .replace("@@DST_ZONE_ID@@", dst_zid or ""))
+
+
+def load_balancing_refs_script():
+    """Load the standalone transformer alongside this template module.
+
+    Keeping the implementation in its own .py file makes it directly runnable
+    and testable while generated workspaces still receive a self-contained copy.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "load-balancing-refs.py")
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()

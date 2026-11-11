@@ -1,6 +1,6 @@
 # cf-discovery
 
-Scans a Cloudflare **account + zone** for every configured resource and produces ready-to-run [`cf-terraforming`](https://github.com/cloudflare/cf-terraforming#v5) exports — the **discovery phase of a zone/account migration, automated**.
+Scans a Cloudflare **account + zone** for every configured resource, produces [`cf-terraforming`](https://github.com/cloudflare/cf-terraforming#v5) exports, and prepares portable load-balancing Terraform — automating the **discovery and load-balancing preparation phases of a zone/account migration**.
 
 ## What it does
 
@@ -16,6 +16,9 @@ Scans a Cloudflare **account + zone** for every configured resource and produces
 3. Emits **working cf-terraforming commands** — either flat (`zone.tf` + `account.tf`) or
    — with `--services DIR` — split into **independent Terraform workspaces, one per
    product area**, each self-contained and carrying its own state file.
+4. Makes **load-balancing exports account-portable**: links pools to their monitors
+   and load balancers to their pools using Terraform expressions, parameterizes
+   account/zone IDs, and removes read-only runtime fields rejected by provider v5.
 
 Every command it generates is known to **complete successfully against a live account** —
 repeated `--resource-id` flags instead of comma-joining, dedicated commands for the ~19
@@ -61,6 +64,7 @@ This writes, per product area (e.g. `services/dns/`, `services/security/`):
 | `terraform.tfvars` | pre-filled with the **target** account/zone IDs (git-ignored) |
 | `.gitignore` | state, plans, binaries, `terraform.tfvars` |
 | `rulesets-import.py` | (`security/` only) builds `imports.tf` |
+| `load-balancing-refs.py` | (`loadbalancing/` only) wires portable monitor/pool/LB references |
 | `README.md` / `export-all.sh` | at the tree root |
 
 ### 2. Set the two tokens
@@ -82,19 +86,118 @@ cd services/dns && bash setup.sh        # or: bash services/export-all.sh  (all,
 2. runs `export.sh` — **once** (`setup.sh --fresh` re-exports); cf-terraforming gets
    `CF_SOURCE_TOKEN`, i.e. it reads from the **source** account
 3. **remaps** account/zone IDs inside the exported `*.tf` from source → target
-4. only in `security/`: runs `rulesets-import.py` → writes `imports.tf`
-5. `terraform init`
+4. only in `loadbalancing/`: runs `load-balancing-refs.py` to create dynamic resource references
+5. only in `security/`: runs `rulesets-import.py` → writes `imports.tf`
+6. formats the load-balancing files where needed, then runs `terraform init`
+
+### Portable load-balancing configuration
+
+The `loadbalancing/` workspace deliberately contains the account-scoped monitors
+and pools together with the zone-scoped load balancers. Its setup step converts
+source IDs into references that establish Terraform's creation order automatically.
+The output follows the [`cloudflare_load_balancer` v5 schema](https://registry.terraform.io/providers/cloudflare/cloudflare/latest/docs/resources/load_balancer):
+
+```hcl
+resource "cloudflare_load_balancer_pool" "terraform_managed_resource_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb_0" {
+  account_id = var.account_id
+  monitor    = cloudflare_load_balancer_monitor.terraform_managed_resource_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0.id
+  # ...all other exported pool configuration is preserved
+}
+
+resource "cloudflare_load_balancer" "terraform_managed_resource_dddddddddddddddddddddddddddddddd_0" {
+  zone_id         = var.zone_id
+  default_pools   = [cloudflare_load_balancer_pool.terraform_managed_resource_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb_0.id]
+  fallback_pool   = cloudflare_load_balancer_pool.terraform_managed_resource_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb_0.id
+  steering_policy = "random"
+
+  random_steering = {
+    default_weight = 1
+    pool_weights = {
+      # Parentheses make the pool ID expression valid as an object key.
+      (cloudflare_load_balancer_pool.terraform_managed_resource_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb_0.id) = 1
+    }
+  }
+}
+```
+
+References are also rewritten inside load-balancer **rule overrides**, `region_pools`,
+`country_pools`, `pop_pools`, and `random_steering.pool_weights` (including dynamic
+map keys). Shared monitors/pools remain shared. Top-level `account_id` and `zone_id`
+values become `var.account_id` and `var.zone_id`, whose values come from the target
+`terraform.tfvars`.
+
+Select/export `cloudflare_load_balancer_monitor`, `cloudflare_load_balancer_pool`,
+and `cloudflare_load_balancer` together. The transformer stops without changing
+files if a referenced resource is missing, rather than generating a configuration
+that points back into the source account. Re-running it is safe; `setup.sh --fresh`
+rebuilds the references after every fresh export.
+
+The transformer also removes exported read-only runtime fields that the v5 provider
+rejects (for example origin `healthy`, `failure_reason`, and `disabled_at`). It keeps
+operational configuration such as `enabled = false`.
+
+Zone-scoped `cloudflare_healthcheck` resources are preserved but remain independent:
+they are not the account-scoped `cloudflare_load_balancer_monitor` objects attached
+to pools.
+
+Dependencies outside these resource types still need review. In particular, pool
+origin `virtual_network_id` values and `*.cfargotunnel.com` addresses belong to
+source-account networking objects; map/recreate those in the target and update the
+pool origins separately. The load-balancing transformer does not guess their target
+IDs.
+
+#### Run it in a newly generated workspace
+
+`setup.sh` runs the transformer automatically. To force a fresh source export and
+rebuild all references:
+
+```bash
+cd services/loadbalancing
+bash setup.sh --fresh
+terraform plan
+terraform apply
+```
+
+#### Run it separately on an existing export
+
+The transformer accepts individual `.tf` files or a directory. Always pass the
+account and zone exports together so cross-file references can be resolved:
+
+```bash
+# From a workspace generated by the updated cf-discovery:
+cd services/loadbalancing
+python3 load-balancing-refs.py . --check   # validate; do not modify files
+python3 load-balancing-refs.py .           # rewrite export in place
+terraform fmt
+terraform validate                         # after terraform init
+terraform plan
+```
+
+For an older workspace that does not contain the helper, invoke it directly from
+this repository:
+
+```bash
+python3 /path/to/scripts/load-balancing-refs.py \
+    /path/to/services/loadbalancing --check
+
+python3 /path/to/scripts/load-balancing-refs.py \
+    /path/to/services/loadbalancing
+```
+
+The standalone transformer makes **no Cloudflare API calls** and never runs
+`terraform apply`. Review `terraform plan`; the migration does not create target
+resources until you explicitly apply it.
 
 ### 4. Import what already exists on the target
 
 Some objects exist on every zone/account and must be **imported, never created** —
 most importantly the default ruleset phase entrypoints. `security/imports.tf` (generated
-in step 3.4) pairs each exported ruleset block with the **target zone's** ruleset ID,
+in step 3.5) pairs each exported ruleset block with the **target zone's** ruleset ID,
 matched by phase:
 
 ```hcl
 import {
-  to = cloudflare_ruleset.terraform_managed_resource_<src_ruleset_id>_<n>   # ddos_l7
+  to = cloudflare_ruleset.terraform_managed_resource_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee_0   # ddos_l7
   id = "<ZONE_B>/<target_ruleset_id>"
 }
 ```
@@ -302,7 +405,9 @@ Minimum for discovery — read access everywhere you want scanned:
 | Log Push | **Read** (optional — without it, `logpush/jobs` probes return 403 and are skipped) |
 | Area 1 / WARP risk-scoring / Pages for Platforms | optional — unentitled probes return 400/403 and are shown as `skip` in the mapping table so you know what to ask Cloudflare about |
 
-The script only performs **GET** requests; nothing is modified.
+Discovery uses only read-only **GET** requests against Cloudflare. The standalone
+load-balancing transformer makes no API requests; it modifies only the local exported
+`.tf` files that you pass to it.
 
 ## cf-terraforming quirks the generated commands already handle
 
@@ -330,8 +435,31 @@ complete end-to-end:
 - **`cloudflare_zone` is deliberately not exported** — the generator pulls every
   visible zone; create the target zone yourself: `terraform import cloudflare_zone.this <zone_id>`
 
+## Development checks
+
+Run the Python regression suite from this directory:
+
+```bash
+python3 -m unittest -v test_load_balancing_refs.py
+python3 -m py_compile cf-discovery.py service_templates.py \
+    load-balancing-refs.py test_load_balancing_refs.py
+```
+
+The tests cover monitor/pool/load-balancer references, nested rule overrides,
+region/country/POP steering, random-steering map keys, runtime-field cleanup,
+unresolved dependencies, idempotency, and generated-workspace integration.
+
+After running `setup.sh` in a generated loadbalancing workspace, also run:
+
+```bash
+terraform -chdir=services/loadbalancing fmt -check
+terraform -chdir=services/loadbalancing validate
+terraform -chdir=services/loadbalancing plan
+```
+
 ## Distribution
 
-Single file, stdlib Python — copy `cf-discovery.py` (+ `service_templates.py` for
-`--services`) anywhere and run. Suggested: `pipx run`, `uv tool run`, or a small
-wrapper script in your tooling repo.
+Stdlib Python only. Copy `cf-discovery.py`, `service_templates.py`, and
+`load-balancing-refs.py` together for `--services` mode; generated loadbalancing
+workspaces receive their own standalone copy of the transformer. Suggested:
+`pipx run`, `uv tool run`, or a small wrapper script in your tooling repo.
